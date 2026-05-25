@@ -1,0 +1,18 @@
+# Generated configuration and local secrets
+config.json
+update_config.sh
+
+# OpenCode local dependencies/cache
+.opencode/node_modules/
+.opencode/package.json
+.opencode/package-lock.json
+.opencode/bun.lock
+
+# Editor and OS files
+.DS_Store
+*.swp
+*.swo
+
+# Test/generated outputs
+tproxy.nft
+tests/tmp/
