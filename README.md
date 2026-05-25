@@ -19,9 +19,7 @@
 ## 文件说明
 
 - `tproxy_ctrl.sh`：主控制脚本，用于设置和清理 TProxy 相关规则。
-- `tproxy.service`：用于运行控制脚本的 systemd 服务文件。
 - `tests/run.sh`：无外部依赖的 POSIX shell 回归测试套件。
-- `update_config.sh`：本地配置下载辅助脚本；可能包含环境相关 URL，因此已被 git 忽略。
 
 ## 使用方法
 
@@ -85,6 +83,37 @@ sudo sh tproxy_ctrl.sh set \
 
 ```sh
 sudo sh tproxy_ctrl.sh unset
+```
+
+## systemd 集成
+
+如果使用发行版或上游提供的 `sing-box.service`，建议通过 systemd drop-in 添加规则，不直接修改原始 service 文件，以保持升级兼容性：
+
+```sh
+sudo systemctl edit sing-box.service
+```
+
+只需要添加 `ExecStartPost` 和 `ExecStopPost`：
+
+```ini
+[Service]
+ExecStartPost=+/etc/sing-box/tproxy_ctrl.sh set --route-table4=100 --route-mark=0x01 --tproxy-port=9898 --fake-ip4=198.18.0.1/15 --hijack-dns --proxy-local --ignore-uid=990
+ExecStopPost=+/etc/sing-box/tproxy_ctrl.sh unset --route-table4=100 --route-mark=0x01 --tproxy-port=9898 --fake-ip4=198.18.0.1/15 --hijack-dns --proxy-local --ignore-uid=990
+```
+
+说明：
+
+- `+` 表示该命令以 root 权限执行，用于配置 nftables、策略路由和 sysctl。
+- `sing-box.service` 默认已经使用 `User=sing-box` 运行，通常不需要在 drop-in 中再次手动配置 `User=` / `Group=`。
+- 启用 `--proxy-local` 时必须通过 `--ignore-uid=<UID>` 或 `--ignore-mark=<MARK>` 跳过 sing-box 自身流量，避免代理回环。
+- `--ignore-uid` 需要填写数字 UID，可用 `id -u sing-box` 查看；上例中的 `990` 仅为示例值。
+
+应用并检查最终合并结果：
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl restart sing-box.service
+systemctl cat sing-box.service
 ```
 
 ## 参数说明

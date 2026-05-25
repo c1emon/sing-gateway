@@ -88,7 +88,7 @@ is_mark() {
 
 is_nft_identifier() {
     case "$1" in
-        ''|[0-9]*|*[^A-Za-z0-9_]*) return 1 ;;
+        ''|[0-9]*|*[!A-Za-z0-9_]*) return 1 ;;
         *) return 0 ;;
     esac
 }
