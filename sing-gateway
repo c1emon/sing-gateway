@@ -1,0 +1,392 @@
+#!/bin/sh
+
+set -eu
+
+ACTION=${1:-}
+if [ "$#" -gt 0 ]; then
+    shift
+fi
+
+CONFIG_FILE=${SING_GATEWAY_CONFIG:-/etc/sing-gateway/gateway.conf}
+LIB_DIR=${SING_GATEWAY_LIB_DIR:-/usr/lib/sing-gateway}
+CTRL=${SING_GATEWAY_CTRL:-$LIB_DIR/tproxy_ctrl.sh}
+DROPIN_TEMPLATE=${SING_GATEWAY_DROPIN_TEMPLATE:-$LIB_DIR/sing-box.service.d/10-sing-gateway.conf}
+DROPIN_DIR=${SING_GATEWAY_DROPIN_DIR:-/etc/systemd/system/sing-box.service.d}
+DROPIN_FILE=${SING_GATEWAY_DROPIN_FILE:-$DROPIN_DIR/10-sing-gateway.conf}
+SERVICE=${SING_GATEWAY_SERVICE:-sing-box.service}
+
+SING_BOX_BIN=${SING_BOX_BIN:-sing-box}
+SYSTEMCTL_BIN=${SYSTEMCTL_BIN:-systemctl}
+JQ_BIN=${JQ_BIN:-jq}
+ID_BIN=${ID_BIN:-id}
+
+STACK=v4
+NF_TABLE=transparent_proxy
+ROUTE_TABLE4=100
+ROUTE_TABLE6=106
+ROUTE_MARK=0x01
+TPROXY_PORT=
+TPROXY_INBOUND_TAG=
+FAKEIP_V4=
+FAKEIP_V6=
+HIJACK_DNS=0
+PROXY_LOCAL=0
+IGNORE_MARK=
+IGNORE_UID=
+SING_BOX_CONFIG_FILE=
+SING_BOX_CONFIG_DIR=
+SING_BOX_WORKDIR=
+SING_BOX_USER=
+SELECTED_INBOUND_TAG=
+SELECTED_INBOUND_PORT=
+CONFIG_SOURCE=
+MERGED_CONFIG=
+
+die() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage: sing-gateway <command> [options]
+
+Commands:
+  check            Validate and print resolved gateway configuration
+  print-command    Print delegated tproxy_ctrl.sh set command
+  print-nft        Print generated nftables rules through tproxy_ctrl.sh --dry-run
+  set              Apply resolved gateway state through tproxy_ctrl.sh
+  unset            Clean managed gateway state through tproxy_ctrl.sh
+  enable [--force] Install sing-box.service drop-in and reload systemd
+  disable          Remove sing-box.service drop-in, best-effort cleanup, reload systemd
+
+Environment overrides for tests/packaging: SING_GATEWAY_CONFIG, SING_GATEWAY_CTRL,
+SING_GATEWAY_LIB_DIR, SING_GATEWAY_DROPIN_TEMPLATE, SING_GATEWAY_DROPIN_DIR,
+SING_GATEWAY_DROPIN_FILE, SING_GATEWAY_SERVICE.
+EOF
+}
+
+bool_value() {
+    case "$1" in
+        1|yes|true|on) printf 1 ;;
+        0|no|false|off|'') printf 0 ;;
+        *) die "invalid boolean value: $1" ;;
+    esac
+}
+
+quote_arg() {
+    case "$1" in
+        *[!A-Za-z0-9_.,:/=@%+-]*) printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\''/g")" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+require_root() {
+    uid=$($ID_BIN -u 2>/dev/null || printf 1)
+    [ "$uid" = 0 ] || die "$ACTION must be run as root"
+}
+
+load_config() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
+
+    STACK=${STACK:-v4}
+    NF_TABLE=${NF_TABLE:-transparent_proxy}
+    ROUTE_TABLE4=${ROUTE_TABLE4:-100}
+    ROUTE_TABLE6=${ROUTE_TABLE6:-106}
+    ROUTE_MARK=${ROUTE_MARK:-0x01}
+    HIJACK_DNS=$(bool_value "${HIJACK_DNS:-0}")
+    PROXY_LOCAL=$(bool_value "${PROXY_LOCAL:-0}")
+}
+
+service_metadata() {
+    meta=$($SYSTEMCTL_BIN show "$SERVICE" -p ExecStart -p User -p WorkingDirectory 2>/dev/null || true)
+    [ -n "$SING_BOX_USER" ] || SING_BOX_USER=$(printf '%s\n' "$meta" | sed -n 's/^User=//p' | sed -n '1p')
+    [ -n "$SING_BOX_WORKDIR" ] || SING_BOX_WORKDIR=$(printf '%s\n' "$meta" | sed -n 's/^WorkingDirectory=//p' | sed -n '1p')
+    exec_start=$(printf '%s\n' "$meta" | sed -n 's/^ExecStart=//p' | sed -n '1p')
+
+    set -- $exec_start
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -c|--config)
+                shift
+                [ "$#" -gt 0 ] && [ -z "$SING_BOX_CONFIG_FILE" ] && SING_BOX_CONFIG_FILE=$1
+                ;;
+            --config=*)
+                [ -z "$SING_BOX_CONFIG_FILE" ] && SING_BOX_CONFIG_FILE=${1#--config=}
+                ;;
+            -C|--config-directory)
+                shift
+                [ "$#" -gt 0 ] && [ -z "$SING_BOX_CONFIG_DIR" ] && SING_BOX_CONFIG_DIR=$1
+                ;;
+            --config-directory=*)
+                [ -z "$SING_BOX_CONFIG_DIR" ] && SING_BOX_CONFIG_DIR=${1#--config-directory=}
+                ;;
+        esac
+        shift || true
+    done
+}
+
+resolve_source() {
+    if [ -n "$SING_BOX_CONFIG_FILE" ]; then
+        [ -f "$SING_BOX_CONFIG_FILE" ] || die "sing-box config file not found: $SING_BOX_CONFIG_FILE"
+        CONFIG_SOURCE=file
+        return 0
+    fi
+    if [ -n "$SING_BOX_CONFIG_DIR" ]; then
+        [ -d "$SING_BOX_CONFIG_DIR" ] || die "sing-box config directory not found: $SING_BOX_CONFIG_DIR"
+        CONFIG_SOURCE=dir
+        return 0
+    fi
+
+    service_metadata
+
+    if [ -n "$SING_BOX_CONFIG_FILE" ]; then
+        [ -f "$SING_BOX_CONFIG_FILE" ] || die "sing-box service config file not found: $SING_BOX_CONFIG_FILE"
+        CONFIG_SOURCE=file
+        return 0
+    fi
+    if [ -n "$SING_BOX_CONFIG_DIR" ]; then
+        [ -d "$SING_BOX_CONFIG_DIR" ] || die "sing-box service config directory not found: $SING_BOX_CONFIG_DIR"
+        CONFIG_SOURCE=dir
+        return 0
+    fi
+
+    if [ -f /etc/sing-box/config.json ]; then
+        SING_BOX_CONFIG_FILE=/etc/sing-box/config.json
+        CONFIG_SOURCE=file
+        return 0
+    fi
+
+    die "cannot discover sing-box config source; set SING_BOX_CONFIG_FILE or SING_BOX_CONFIG_DIR in $CONFIG_FILE"
+}
+
+sing_box_check() {
+    case "$CONFIG_SOURCE" in
+        file) "$SING_BOX_BIN" check -c "$SING_BOX_CONFIG_FILE" >/dev/null ;;
+        dir) "$SING_BOX_BIN" check -C "$SING_BOX_CONFIG_DIR" >/dev/null ;;
+        *) die "internal error: no config source" ;;
+    esac
+}
+
+merge_config() {
+    tmp=${TMPDIR:-/tmp}/sing-gateway-config.$$
+    trap 'rm -f "$tmp"' EXIT HUP INT TERM
+    case "$CONFIG_SOURCE" in
+        file)
+            "$JQ_BIN" -c . "$SING_BOX_CONFIG_FILE" > "$tmp"
+            ;;
+        dir)
+            if "$SING_BOX_BIN" merge -C "$SING_BOX_CONFIG_DIR" > "$tmp" 2>/dev/null; then
+                :
+            else
+                set -- "$SING_BOX_CONFIG_DIR"/*.json
+                [ -e "$1" ] || die "no JSON files found in config directory: $SING_BOX_CONFIG_DIR"
+                "$JQ_BIN" -s 'reduce .[] as $item ({}; . * $item)' "$@" > "$tmp"
+            fi
+            ;;
+    esac
+    MERGED_CONFIG=$tmp
+}
+
+first_or_empty() {
+    sed -n '1p'
+}
+
+count_lines() {
+    awk 'END { print NR + 0 }'
+}
+
+resolve_tproxy() {
+    count=$($JQ_BIN -r '[.inbounds[]? | select(.type == "tproxy")] | length' "$MERGED_CONFIG")
+    [ "$count" -gt 0 ] || die "no tproxy inbound found in sing-box configuration"
+
+    if [ "$count" -gt 1 ] && [ -z "$TPROXY_INBOUND_TAG" ]; then
+        die "multiple tproxy inbounds found; set TPROXY_INBOUND_TAG"
+    fi
+
+    if [ -n "$TPROXY_INBOUND_TAG" ]; then
+        selected=$($JQ_BIN -r --arg tag "$TPROXY_INBOUND_TAG" '.inbounds[]? | select(.type == "tproxy" and .tag == $tag) | [.tag, (.listen_port // .port // "")] | @tsv' "$MERGED_CONFIG" | first_or_empty)
+        [ -n "$selected" ] || die "configured TPROXY_INBOUND_TAG not found: $TPROXY_INBOUND_TAG"
+    else
+        selected=$($JQ_BIN -r '.inbounds[]? | select(.type == "tproxy") | [.tag, (.listen_port // .port // "")] | @tsv' "$MERGED_CONFIG" | first_or_empty)
+    fi
+
+    SELECTED_INBOUND_TAG=$(printf '%s' "$selected" | awk -F '\t' '{print $1}')
+    SELECTED_INBOUND_PORT=$(printf '%s' "$selected" | awk -F '\t' '{print $2}')
+    [ -n "$SELECTED_INBOUND_PORT" ] || die "selected tproxy inbound has no listen_port"
+
+    if [ -n "$TPROXY_PORT" ] && [ "$TPROXY_PORT" != "$SELECTED_INBOUND_PORT" ]; then
+        die "configured TPROXY_PORT=$TPROXY_PORT conflicts with inbound port $SELECTED_INBOUND_PORT"
+    fi
+    TPROXY_PORT=${TPROXY_PORT:-$SELECTED_INBOUND_PORT}
+}
+
+unique_setting() {
+    values=$1
+    label=$2
+    configured=$3
+    count=$(printf '%s\n' "$values" | sed '/^$/d' | sort -u | count_lines)
+    if [ "$count" -gt 1 ]; then
+        die "multiple conflicting $label values found; set explicit gateway value"
+    fi
+    inferred=$(printf '%s\n' "$values" | sed '/^$/d' | sort -u | first_or_empty)
+    if [ -n "$configured" ] && [ -n "$inferred" ] && [ "$configured" != "$inferred" ]; then
+        die "configured $label=$configured conflicts with sing-box value $inferred"
+    fi
+    printf '%s' "${configured:-$inferred}"
+}
+
+resolve_fakeip() {
+    v4s=$($JQ_BIN -r '[.. | objects | .inet4_range? // empty] | .[]' "$MERGED_CONFIG")
+    v6s=$($JQ_BIN -r '[.. | objects | .inet6_range? // empty] | .[]' "$MERGED_CONFIG")
+    FAKEIP_V4=$(unique_setting "$v4s" FAKEIP_V4 "$FAKEIP_V4")
+    FAKEIP_V6=$(unique_setting "$v6s" FAKEIP_V6 "$FAKEIP_V6")
+}
+
+resolve_local_bypass() {
+    [ "$PROXY_LOCAL" = 1 ] || return 0
+    if [ -n "$IGNORE_MARK" ] || [ -n "$IGNORE_UID" ]; then
+        return 0
+    fi
+    [ -n "$SING_BOX_USER" ] || service_metadata
+    case "${SING_BOX_USER:-}" in
+        ''|root|0) die "PROXY_LOCAL requires explicit IGNORE_UID or IGNORE_MARK when sing-box user is root or unknown" ;;
+    esac
+    IGNORE_UID=$($ID_BIN -u "$SING_BOX_USER" 2>/dev/null || true)
+    [ -n "$IGNORE_UID" ] || die "cannot infer uid for sing-box service user: $SING_BOX_USER"
+    [ "$IGNORE_UID" != 0 ] || die "refusing to infer root ignore uid"
+}
+
+resolve_full() {
+    load_config
+    command -v "$JQ_BIN" >/dev/null 2>&1 || die "jq is required"
+    resolve_source
+    if ! sing_box_check; then
+        die "sing-box config validation failed"
+    fi
+    merge_config
+    resolve_tproxy
+    resolve_fakeip
+    resolve_local_bypass
+}
+
+resolve_cleanup() {
+    load_config
+    TPROXY_PORT=${TPROXY_PORT:-9898}
+}
+
+ctrl_args() {
+    printf ' --stack=%s' "$STACK"
+    printf ' --nf-table=%s' "$NF_TABLE"
+    printf ' --route-table4=%s' "$ROUTE_TABLE4"
+    printf ' --route-table6=%s' "$ROUTE_TABLE6"
+    printf ' --route-mark=%s' "$ROUTE_MARK"
+    printf ' --tproxy-port=%s' "$TPROXY_PORT"
+    [ -z "$FAKEIP_V4" ] || printf ' --fake-ip4=%s' "$FAKEIP_V4"
+    [ -z "$FAKEIP_V6" ] || printf ' --fake-ip6=%s' "$FAKEIP_V6"
+    [ "$HIJACK_DNS" = 1 ] && printf ' --hijack-dns'
+    if [ "$PROXY_LOCAL" = 1 ]; then
+        printf ' --proxy-local'
+        [ -z "$IGNORE_MARK" ] || printf ' --ignore-mark=%s' "$IGNORE_MARK"
+        [ -z "$IGNORE_UID" ] || printf ' --ignore-uid=%s' "$IGNORE_UID"
+    fi
+}
+
+print_ctrl_command() {
+    action=$1
+    dry=${2:-0}
+    quote_arg "$CTRL"
+    printf ' %s' "$action"
+    [ "$dry" = 1 ] && printf ' --dry-run'
+    for arg in $(ctrl_args); do
+        printf ' '
+        quote_arg "$arg"
+    done
+    printf '\n'
+}
+
+run_ctrl() {
+    action=$1
+    shift
+    # shellcheck disable=SC2046
+    "$CTRL" "$action" "$@" $(ctrl_args)
+}
+
+show_check() {
+    cat <<EOF
+sing-gateway configuration OK
+config_source=$CONFIG_SOURCE
+sing_box_config_file=$SING_BOX_CONFIG_FILE
+sing_box_config_dir=$SING_BOX_CONFIG_DIR
+sing_box_user=${SING_BOX_USER:-}
+tproxy_inbound_tag=$SELECTED_INBOUND_TAG
+tproxy_port=$TPROXY_PORT
+stack=$STACK
+nf_table=$NF_TABLE
+route_table4=$ROUTE_TABLE4
+route_table6=$ROUTE_TABLE6
+route_mark=$ROUTE_MARK
+fakeip_v4=$FAKEIP_V4
+fakeip_v6=$FAKEIP_V6
+hijack_dns=$HIJACK_DNS
+proxy_local=$PROXY_LOCAL
+ignore_mark=$IGNORE_MARK
+ignore_uid=$IGNORE_UID
+EOF
+}
+
+install_dropin() {
+    [ -f "$DROPIN_TEMPLATE" ] || die "drop-in template not found: $DROPIN_TEMPLATE"
+    mkdir -p "$DROPIN_DIR"
+    tmp=$DROPIN_FILE.$$
+    cp "$DROPIN_TEMPLATE" "$tmp"
+    chmod 0644 "$tmp"
+    mv "$tmp" "$DROPIN_FILE"
+}
+
+daemon_reload() {
+    "$SYSTEMCTL_BIN" daemon-reload >/dev/null 2>&1 || die "systemctl daemon-reload failed"
+}
+
+cmd_enable() {
+    force=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --force) force=1 ;;
+            *) die "unknown enable option: $1" ;;
+        esac
+        shift
+    done
+    require_root
+    if [ "$force" != 1 ]; then
+        resolve_full
+    fi
+    install_dropin
+    daemon_reload
+    printf 'sing-gateway integration enabled for %s.\n' "$SERVICE"
+    printf 'Restart sing-box to apply: systemctl restart %s\n' "$SERVICE"
+}
+
+cmd_disable() {
+    require_root
+    rm -f "$DROPIN_FILE"
+    resolve_cleanup
+    run_ctrl unset >/dev/null 2>&1 || true
+    daemon_reload
+    printf 'sing-gateway integration disabled for %s.\n' "$SERVICE"
+    printf 'sing-box was not started or restarted.\n'
+}
+
+case "$ACTION" in
+    -h|--help|'') usage ;;
+    check) resolve_full; show_check ;;
+    print-command) resolve_full; print_ctrl_command set 0 ;;
+    print-nft) resolve_full; run_ctrl set --dry-run ;;
+    set) resolve_full; if ! run_ctrl set; then resolve_cleanup; run_ctrl unset >/dev/null 2>&1 || true; exit 1; fi ;;
+    unset) resolve_cleanup; run_ctrl unset ;;
+    enable) cmd_enable "$@" ;;
+    disable) cmd_disable "$@" ;;
+    *) die "unknown command: $ACTION" ;;
+esac

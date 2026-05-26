@@ -19,7 +19,10 @@
 ## 文件说明
 
 - `tproxy_ctrl.sh`：主控制脚本，用于设置和清理 TProxy 相关规则。
+- `sing-gateway`：Debian companion package 的用户入口，用于发现 sing-box 配置、验证并委托 `tproxy_ctrl.sh`。
+- `packaging/`、`debian/`：`sing-gateway` 包的默认配置、systemd drop-in 模板和 Debian 打包元数据。
 - `tests/run.sh`：无外部依赖的 POSIX shell 回归测试套件。
+- `Makefile`：可选维护者辅助入口，`make deb` 仅委托标准 Debian 构建工具。
 
 ## 使用方法
 
@@ -86,6 +89,89 @@ sudo sh tproxy_ctrl.sh unset
 ```
 
 ## systemd 集成
+
+Debian 系统上推荐使用 `sing-gateway` companion package 提供的显式启用流程。安装包本身是惰性的，不会创建 active drop-in、重启 sing-box、调用 nftables、修改路由或修改 sysctl。
+
+典型流程：
+
+```sh
+sudo sing-gateway check
+sudo sing-gateway print-command
+sudo sing-gateway print-nft
+sudo sing-gateway enable
+sudo systemctl restart sing-box.service
+```
+
+`sing-gateway enable` 会验证配置、安装 `/etc/systemd/system/sing-box.service.d/10-sing-gateway.conf`、执行 `systemctl daemon-reload`，并提示用户重启 sing-box；它不会自动启动或重启 sing-box。需要临时跳过启用前验证时可使用 `sing-gateway enable --force`，但服务启动时仍会通过 `ExecStartPre=+sing-gateway check` 失败关闭。
+
+禁用集成：
+
+```sh
+sudo sing-gateway disable
+```
+
+该命令会移除 active drop-in、尽力清理脚本管理的 nftables/策略路由状态，并 reload systemd；不会启动或重启 sing-box。更多 Debian 包说明见 `docs/sing-gateway.md`。
+
+## Debian 包构建与检查
+
+在 Debian/Ubuntu 构建环境中安装维护者工具：
+
+```sh
+sudo apt-get update
+sudo apt-get install --no-install-recommends \
+  build-essential devscripts debhelper lintian dpkg-dev
+```
+
+标准构建路径以 `debian/` 元数据为唯一事实来源：
+
+```sh
+dpkg-buildpackage -us -uc -b
+```
+
+安装 `devscripts` 后也可以使用等价命令：
+
+```sh
+debuild -us -uc -b
+```
+
+可选的本地辅助命令 `make deb` 只是调用 `dpkg-buildpackage -us -uc -b`，不会复制包元数据或文件列表。
+
+构建产物会写入仓库父目录，通常包括：
+
+```text
+../sing-gateway_<version>_all.deb
+../sing-gateway_<version>_<arch>.changes
+../sing-gateway_<version>_<arch>.buildinfo
+```
+
+安装前检查包元数据、文件列表和 lintian 输出：
+
+```sh
+dpkg-deb --info ../sing-gateway_*_all.deb
+dpkg-deb --contents ../sing-gateway_*_all.deb
+lintian ../sing-gateway_<version>_<arch>.changes ../sing-gateway_*_all.deb
+```
+
+`dpkg-deb --info` 应展示包名、版本、架构、依赖、维护者和描述；文件列表应包含 CLI、控制脚本、默认配置、文档和 systemd drop-in 模板。
+
+建议只在一次性 Debian/Ubuntu VM 或容器中测试安装生命周期：
+
+```sh
+sudo apt-get install ./../sing-gateway_*_all.deb
+test ! -e /etc/systemd/system/sing-box.service.d/10-sing-gateway.conf
+command -v sing-gateway
+dpkg -L sing-gateway
+sudo sing-gateway enable
+test -e /etc/systemd/system/sing-box.service.d/10-sing-gateway.conf
+sudo apt-get remove sing-gateway
+test ! -e /etc/systemd/system/sing-box.service.d/10-sing-gateway.conf
+sudo apt-get purge sing-gateway
+test ! -d /etc/sing-gateway
+```
+
+安装包必须保持惰性：安装时不创建 active drop-in、不启动或重启 sing-box、不调用 nftables、不修改路由或 sysctl。只有显式运行 `sing-gateway enable` 才会启用集成；remove/purge 清理路径也不应启动或重启服务。
+
+### 手动 drop-in
 
 如果使用发行版或上游提供的 `sing-box.service`，建议通过 systemd drop-in 添加规则，不直接修改原始 service 文件，以保持升级兼容性：
 

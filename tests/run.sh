@@ -2,6 +2,7 @@
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 CTRL="$ROOT_DIR/tproxy_ctrl.sh"
+GATEWAY="$ROOT_DIR/sing-gateway"
 
 WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/tproxy-ctrl-test.XXXXXX")
 FAKE_BIN="$WORKDIR/bin"
@@ -102,7 +103,78 @@ printf 'sysctl %s\n' "$*" >> "${FAKE_LOG:-/dev/null}"
 exit 0
 EOF
 
-chmod +x "$FAKE_BIN/nft" "$FAKE_BIN/ip" "$FAKE_BIN/sysctl"
+cat > "$FAKE_BIN/sing-box" <<'EOF'
+#!/bin/sh
+log=${FAKE_LOG:-/dev/null}
+printf 'sing-box %s\n' "$*" >> "$log"
+
+case "$1" in
+    check)
+        if [ "${FAKE_SING_BOX_CHECK_FAIL:-0}" = 1 ]; then
+            exit 1
+        fi
+        exit 0
+        ;;
+    merge)
+        if [ -n "${FAKE_SING_BOX_MERGE_FILE:-}" ]; then
+            cat "$FAKE_SING_BOX_MERGE_FILE"
+            exit 0
+        fi
+        exit 1
+        ;;
+esac
+
+exit 0
+EOF
+
+cat > "$FAKE_BIN/systemctl" <<'EOF'
+#!/bin/sh
+log=${FAKE_LOG:-/dev/null}
+printf 'systemctl %s\n' "$*" >> "$log"
+
+case "$1" in
+    show)
+        if [ -n "${FAKE_SYSTEMCTL_SHOW:-}" ]; then
+            printf '%s\n' "$FAKE_SYSTEMCTL_SHOW"
+        else
+            printf 'ExecStart=\nUser=\nWorkingDirectory=\n'
+        fi
+        exit 0
+        ;;
+    daemon-reload)
+        exit 0
+        ;;
+    start|restart)
+        printf 'unexpected service mutation: systemctl %s\n' "$*" >&2
+        exit 9
+        ;;
+esac
+
+exit 0
+EOF
+
+cat > "$FAKE_BIN/id" <<'EOF'
+#!/bin/sh
+printf 'id %s\n' "$*" >> "${FAKE_LOG:-/dev/null}"
+
+if [ "$1" = "-u" ]; then
+    if [ "$#" -eq 1 ]; then
+        printf '%s\n' "${FAKE_CURRENT_UID:-0}"
+        exit 0
+    fi
+    case "$2" in
+        root) printf '0\n' ;;
+        sing-box) printf '%s\n' "${FAKE_ID_SING_BOX_UID:-990}" ;;
+        *) printf '%s\n' "${FAKE_ID_UID:-1000}" ;;
+    esac
+    exit 0
+fi
+
+exit 1
+EOF
+
+chmod +x "$FAKE_BIN/nft" "$FAKE_BIN/ip" "$FAKE_BIN/sysctl" \
+    "$FAKE_BIN/sing-box" "$FAKE_BIN/systemctl" "$FAKE_BIN/id"
 
 ORIG_PATH=$PATH
 TOTAL=0
@@ -130,11 +202,19 @@ reset_fake_env() {
     FAKE_IP_RULE_DEL_FAIL=1
     FAKE_IP_ROUTE_FAIL=0
     FAKE_IP_ROUTE_DEL_FAIL=1
+    FAKE_SING_BOX_CHECK_FAIL=0
+    FAKE_SING_BOX_MERGE_FILE=
+    FAKE_SYSTEMCTL_SHOW=
+    FAKE_CURRENT_UID=0
+    FAKE_ID_SING_BOX_UID=990
+    FAKE_ID_UID=1000
 
     export FAKE_NFT_DELETE_FAIL FAKE_NFT_APPLY_FAIL
     export FAKE_IP_RULE_SHOW_PRESENT FAKE_IP_RULE_SHOW_OUTPUT
     export FAKE_IP_RULE_ADD_FAIL FAKE_IP_RULE_DEL_FAIL
     export FAKE_IP_ROUTE_FAIL FAKE_IP_ROUTE_DEL_FAIL
+    export FAKE_SING_BOX_CHECK_FAIL FAKE_SING_BOX_MERGE_FILE
+    export FAKE_SYSTEMCTL_SHOW FAKE_CURRENT_UID FAKE_ID_SING_BOX_UID FAKE_ID_UID
 }
 
 fail_assert() {
@@ -240,6 +320,62 @@ run_ctrl() {
     LAST_LOG=$log
     LAST_STATUS=$status
 }
+
+run_gateway() {
+    case_name=$1
+    shift
+    case_dir="$WORKDIR/$case_name"
+    mkdir -p "$case_dir"
+    stdout="$case_dir/stdout"
+    stderr="$case_dir/stderr"
+    log="$case_dir/fake.log"
+    : > "$log"
+
+    FAKE_LOG=$log
+    export FAKE_LOG
+
+    PATH="$FAKE_BIN:$ORIG_PATH" \
+    SING_GATEWAY_CONFIG="$case_dir/gateway.conf" \
+    SING_GATEWAY_CTRL="$case_dir/tproxy_ctrl.sh" \
+    SING_GATEWAY_DROPIN_TEMPLATE="$case_dir/template.conf" \
+    SING_GATEWAY_DROPIN_DIR="$case_dir/sing-box.service.d" \
+    SING_GATEWAY_DROPIN_FILE="$case_dir/sing-box.service.d/10-sing-gateway.conf" \
+    sh "$GATEWAY" "$@" >"$stdout" 2>"$stderr"
+    status=$?
+
+    LAST_STDOUT=$stdout
+    LAST_STDERR=$stderr
+    LAST_LOG=$log
+    LAST_STATUS=$status
+}
+
+write_gateway_fixture() {
+    case_dir=$1
+    config_json=$2
+    mkdir -p "$case_dir"
+    cp "$CTRL" "$case_dir/tproxy_ctrl.sh"
+    chmod +x "$case_dir/tproxy_ctrl.sh"
+    cat > "$case_dir/template.conf" <<'EOF'
+[Service]
+ExecStartPre=+/usr/bin/sing-gateway check
+ExecStartPost=+/usr/bin/sing-gateway set
+ExecStopPost=+/usr/bin/sing-gateway unset
+EOF
+    printf '%s\n' "$config_json" > "$case_dir/config.json"
+    cat > "$case_dir/gateway.conf" <<EOF
+SING_BOX_CONFIG_FILE=$case_dir/config.json
+STACK=all
+NF_TABLE=sg_test
+ROUTE_TABLE4=200
+ROUTE_TABLE6=206
+ROUTE_MARK=0x20
+EOF
+}
+
+gateway_config_single='{
+  "inbounds": [{"type":"tproxy","tag":"tp-in","listen_port":9898}],
+  "dns": {"fakeip": {"inet4_range":"198.18.0.0/15", "inet6_range":"fc00::/18"}}
+}'
 
 run_test() {
     TOTAL=$((TOTAL + 1))
@@ -677,6 +813,191 @@ test_optional_nft_parser_check() {
     fail_assert "optional nft parser check failed with $real_nft"
 }
 
+test_gateway_package_layout() {
+    assert_file_exists "$ROOT_DIR/debian/control"
+    assert_file_exists "$ROOT_DIR/debian/install"
+    assert_file_exists "$ROOT_DIR/debian/prerm"
+    assert_file_exists "$ROOT_DIR/debian/postrm"
+    assert_file_exists "$ROOT_DIR/packaging/gateway.conf"
+    assert_file_exists "$ROOT_DIR/packaging/sing-box.service.d/10-sing-gateway.conf"
+    assert_file_exists "$ROOT_DIR/sing-gateway"
+
+    assert_contains "$ROOT_DIR/debian/install" "tproxy_ctrl.sh usr/lib/sing-gateway/"
+    assert_contains "$ROOT_DIR/debian/install" "sing-gateway usr/bin/"
+    assert_contains "$ROOT_DIR/debian/install" "packaging/gateway.conf etc/sing-gateway/"
+    assert_contains "$ROOT_DIR/debian/control" "sing-box"
+    assert_contains "$ROOT_DIR/debian/control" "nftables"
+    assert_contains "$ROOT_DIR/debian/control" "iproute2"
+    assert_contains "$ROOT_DIR/debian/control" "procps"
+    assert_contains "$ROOT_DIR/debian/control" "jq"
+    assert_contains "$ROOT_DIR/debian/control" "systemd"
+    assert_contains "$ROOT_DIR/packaging/sing-box.service.d/10-sing-gateway.conf" "ExecStartPre=+/usr/bin/sing-gateway check"
+    assert_contains "$ROOT_DIR/packaging/sing-box.service.d/10-sing-gateway.conf" "ExecStartPost=+/usr/bin/sing-gateway set"
+    assert_contains "$ROOT_DIR/packaging/sing-box.service.d/10-sing-gateway.conf" "ExecStopPost=+/usr/bin/sing-gateway unset"
+}
+
+test_gateway_check_and_diagnostics() {
+    reset_fake_env
+    case_dir="$WORKDIR/gateway-check"
+    write_gateway_fixture "$case_dir" "$gateway_config_single"
+
+    run_gateway gateway-check check
+    assert_status 0 "$LAST_STATUS" "gateway check"
+    assert_contains "$LAST_STDOUT" "sing-gateway configuration OK"
+    assert_contains "$LAST_STDOUT" "tproxy_inbound_tag=tp-in"
+    assert_contains "$LAST_STDOUT" "tproxy_port=9898"
+    assert_contains "$LAST_STDOUT" "fakeip_v4=198.18.0.0/15"
+    assert_contains "$LAST_STDOUT" "fakeip_v6=fc00::/18"
+    assert_contains "$LAST_LOG" "sing-box check -c $case_dir/config.json"
+    assert_not_contains "$LAST_LOG" "nft "
+    assert_not_contains "$LAST_LOG" "ip "
+    assert_not_contains "$LAST_LOG" "sysctl "
+
+    run_gateway gateway-check print-command
+    assert_status 0 "$LAST_STATUS" "gateway print-command"
+    assert_contains "$LAST_STDOUT" "$case_dir/tproxy_ctrl.sh set --stack=all --nf-table=sg_test --route-table4=200 --route-table6=206 --route-mark=0x20 --tproxy-port=9898 --fake-ip4=198.18.0.0/15 --fake-ip6=fc00::/18"
+
+    run_gateway gateway-check print-nft
+    assert_status 0 "$LAST_STATUS" "gateway print-nft"
+    assert_contains "$LAST_STDOUT" "table inet sg_test"
+    assert_contains "$LAST_STDOUT" "198.18.0.0/15"
+    assert_not_contains "$LAST_LOG" "nft -f -"
+}
+
+test_gateway_enable_disable() {
+    reset_fake_env
+    case_dir="$WORKDIR/gateway-enable"
+    write_gateway_fixture "$case_dir" "$gateway_config_single"
+
+    run_gateway gateway-enable enable
+    assert_status 0 "$LAST_STATUS" "enable valid"
+    assert_file_exists "$case_dir/sing-box.service.d/10-sing-gateway.conf"
+    assert_contains "$case_dir/sing-box.service.d/10-sing-gateway.conf" "ExecStartPre=+/usr/bin/sing-gateway check"
+    assert_contains "$LAST_LOG" "systemctl daemon-reload"
+    assert_not_contains "$LAST_LOG" "systemctl restart"
+    assert_not_contains "$LAST_LOG" "systemctl start"
+    assert_contains "$LAST_STDOUT" "Restart sing-box to apply"
+
+    reset_fake_env
+    FAKE_SING_BOX_CHECK_FAIL=1
+    export FAKE_SING_BOX_CHECK_FAIL
+    rm -f "$case_dir/sing-box.service.d/10-sing-gateway.conf"
+    run_gateway gateway-enable enable
+    assert_status 1 "$LAST_STATUS" "enable invalid"
+    assert_file_not_exists "$case_dir/sing-box.service.d/10-sing-gateway.conf"
+
+    run_gateway gateway-enable enable --force
+    assert_status 0 "$LAST_STATUS" "force enable"
+    assert_file_exists "$case_dir/sing-box.service.d/10-sing-gateway.conf"
+    assert_contains "$case_dir/sing-box.service.d/10-sing-gateway.conf" "ExecStartPre=+/usr/bin/sing-gateway check"
+
+    reset_fake_env
+    run_gateway gateway-enable disable
+    assert_status 0 "$LAST_STATUS" "disable"
+    assert_file_not_exists "$case_dir/sing-box.service.d/10-sing-gateway.conf"
+    assert_contains "$LAST_LOG" "nft delete table inet sg_test"
+    assert_contains "$LAST_LOG" "systemctl daemon-reload"
+    assert_not_contains "$LAST_LOG" "systemctl restart"
+}
+
+test_gateway_discovery_and_safety() {
+    reset_fake_env
+    case_dir="$WORKDIR/gateway-discovery"
+    mkdir -p "$case_dir"
+    cp "$CTRL" "$case_dir/tproxy_ctrl.sh"
+    chmod +x "$case_dir/tproxy_ctrl.sh"
+    cat > "$case_dir/template.conf" <<'EOF'
+[Service]
+ExecStartPre=+/usr/bin/sing-gateway check
+ExecStartPost=+/usr/bin/sing-gateway set
+ExecStopPost=+/usr/bin/sing-gateway unset
+EOF
+    printf '%s\n' "$gateway_config_single" > "$case_dir/config.json"
+    cat > "$case_dir/gateway.conf" <<EOF
+STACK=v4
+EOF
+    FAKE_SYSTEMCTL_SHOW="ExecStart=/usr/bin/sing-box run -c $case_dir/config.json
+User=sing-box
+WorkingDirectory=/var/lib/sing-box"
+    export FAKE_SYSTEMCTL_SHOW
+    run_gateway gateway-discovery check
+    assert_status 0 "$LAST_STATUS" "service discovery"
+    assert_contains "$LAST_STDOUT" "sing_box_config_file=$case_dir/config.json"
+    assert_contains "$LAST_STDOUT" "sing_box_user=sing-box"
+
+    multi='{"inbounds":[{"type":"tproxy","tag":"a","listen_port":1000},{"type":"tproxy","tag":"b","listen_port":2000}]}'
+    write_gateway_fixture "$case_dir" "$multi"
+    run_gateway gateway-discovery check
+    assert_status 1 "$LAST_STATUS" "ambiguous tproxy"
+    assert_contains "$LAST_STDERR" "multiple tproxy inbounds"
+    printf 'TPROXY_INBOUND_TAG=b\n' >> "$case_dir/gateway.conf"
+    run_gateway gateway-discovery check
+    assert_status 0 "$LAST_STATUS" "selected tproxy"
+    assert_contains "$LAST_STDOUT" "tproxy_inbound_tag=b"
+    assert_contains "$LAST_STDOUT" "tproxy_port=2000"
+
+    conflict='{"inbounds":[{"type":"tproxy","tag":"tp","listen_port":9898}],"dns":{"a":{"inet4_range":"198.18.0.0/15"},"b":{"inet4_range":"198.19.0.0/16"}}}'
+    write_gateway_fixture "$case_dir" "$conflict"
+    run_gateway gateway-discovery check
+    assert_status 1 "$LAST_STATUS" "fakeip conflict"
+    assert_contains "$LAST_STDERR" "multiple conflicting FAKEIP_V4"
+
+    write_gateway_fixture "$case_dir" "$gateway_config_single"
+    printf 'PROXY_LOCAL=1\n' >> "$case_dir/gateway.conf"
+    FAKE_SYSTEMCTL_SHOW="ExecStart=/usr/bin/sing-box run -c $case_dir/config.json
+User=root
+WorkingDirectory=/"
+    export FAKE_SYSTEMCTL_SHOW
+    run_gateway gateway-discovery check
+    assert_status 1 "$LAST_STATUS" "root local proxy unsafe"
+    assert_contains "$LAST_STDERR" "PROXY_LOCAL requires explicit IGNORE_UID or IGNORE_MARK"
+    printf 'IGNORE_MARK=0x30\n' >> "$case_dir/gateway.conf"
+    run_gateway gateway-discovery check
+    assert_status 0 "$LAST_STATUS" "explicit ignore mark"
+    assert_contains "$LAST_STDOUT" "ignore_mark=0x30"
+}
+
+test_gateway_lifecycle_delegation() {
+    reset_fake_env
+    case_dir="$WORKDIR/gateway-lifecycle"
+    write_gateway_fixture "$case_dir" "$gateway_config_single"
+    printf 'HIJACK_DNS=1\nPROXY_LOCAL=1\nIGNORE_UID=990\n' >> "$case_dir/gateway.conf"
+
+    run_gateway gateway-lifecycle set
+    assert_status 0 "$LAST_STATUS" "gateway set"
+    assert_in_order "$LAST_LOG" \
+        "sing-box check -c $case_dir/config.json" \
+        "nft delete table inet sg_test" \
+        "nft -f -" \
+        "ip rule show fwmark 0x20 table 200"
+    assert_contains "$LAST_LOG" "ip -6 rule show fwmark 0x20 table 206"
+
+    FAKE_IP_ROUTE_FAIL=1
+    export FAKE_IP_ROUTE_FAIL
+    run_gateway gateway-lifecycle set
+    assert_status 1 "$LAST_STATUS" "gateway set cleanup on failure"
+    assert_contains "$LAST_LOG" "ip route replace local 0.0.0.0/0 dev lo table 200"
+    assert_contains "$LAST_LOG" "nft delete table inet sg_test"
+
+    reset_fake_env
+    run_gateway gateway-lifecycle unset
+    assert_status 0 "$LAST_STATUS" "gateway unset"
+    assert_contains "$LAST_LOG" "nft delete table inet sg_test"
+    assert_contains "$LAST_LOG" "ip rule del fwmark 0x20 table 200"
+}
+
+test_maintainer_scripts() {
+    reset_fake_env
+    assert_contains "$ROOT_DIR/debian/prerm" "remove|deconfigure"
+    assert_contains "$ROOT_DIR/debian/prerm" "sing-gateway disable"
+    assert_contains "$ROOT_DIR/debian/prerm" "upgrade|failed-upgrade"
+    assert_not_contains "$ROOT_DIR/debian/prerm" "systemctl restart"
+    assert_not_contains "$ROOT_DIR/debian/prerm" "systemctl start"
+    assert_contains "$ROOT_DIR/debian/postrm" "purge"
+    assert_contains "$ROOT_DIR/debian/postrm" "rm -rf /etc/sing-gateway"
+    assert_not_contains "$ROOT_DIR/debian/postrm" "systemctl restart"
+}
+
 main() {
     printf 'tproxy_ctrl.sh regression suite\n'
     printf 'Run: sh tests/run.sh\n'
@@ -705,6 +1026,12 @@ main() {
     run_test "Rollback on route failure" test_rollback_on_route_failure
     run_test "nft apply failure" test_nft_apply_failure
     run_test "Optional nft parser check" test_optional_nft_parser_check
+    run_test "sing-gateway package layout" test_gateway_package_layout
+    run_test "sing-gateway check and diagnostics" test_gateway_check_and_diagnostics
+    run_test "sing-gateway enable and disable" test_gateway_enable_disable
+    run_test "sing-gateway discovery and safety" test_gateway_discovery_and_safety
+    run_test "sing-gateway lifecycle delegation" test_gateway_lifecycle_delegation
+    run_test "sing-gateway maintainer scripts" test_maintainer_scripts
 
     printf '\nSummary: %d passed, %d failed, %d skipped, %d total\n' "$PASS" "$FAIL" "$SKIP" "$TOTAL"
     [ "$FAIL" -eq 0 ]

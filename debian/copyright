@@ -1,0 +1,12 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: sing-gateway
+Source: local repository checkout
+
+Files: *
+Copyright: 2026 sing-gateway maintainers
+License: all-rights-reserved
+ No license grant has been declared in this repository.
+ .
+ This Debian metadata records the current copyright status for local package
+ builds and inspection only. Add the upstream project license here before any
+ public redistribution of package artifacts.
