@@ -258,6 +258,14 @@ assert_not_contains() {
     fi
 }
 
+assert_symlink_target() {
+    link=$1
+    target=$2
+    [ -L "$link" ] || fail_assert "expected symlink: $link"
+    actual=$(readlink "$link" 2>/dev/null || true)
+    [ "$actual" = "$target" ] || fail_assert "expected symlink target $target, got $actual for $link"
+}
+
 assert_same_files() {
     left=$1
     right=$2
@@ -340,6 +348,7 @@ run_gateway() {
     SING_GATEWAY_DROPIN_TEMPLATE="$case_dir/template.conf" \
     SING_GATEWAY_DROPIN_DIR="$case_dir/sing-box.service.d" \
     SING_GATEWAY_DROPIN_FILE="$case_dir/sing-box.service.d/10-sing-gateway.conf" \
+    SING_GATEWAY_STATE_FILE="$case_dir/enabled" \
     sh "$GATEWAY" "$@" >"$stdout" 2>"$stderr"
     status=$?
 
@@ -825,6 +834,13 @@ test_gateway_package_layout() {
     assert_contains "$ROOT_DIR/debian/install" "tproxy_ctrl.sh usr/lib/sing-gateway/"
     assert_contains "$ROOT_DIR/debian/install" "sing-gateway usr/bin/"
     assert_contains "$ROOT_DIR/debian/install" "packaging/gateway.conf etc/sing-gateway/"
+    assert_not_contains "$ROOT_DIR/debian/install" "docs/sing-gateway.md usr/share/doc/sing-gateway/"
+    assert_contains "$ROOT_DIR/debian/source/format" "3.0 (native)"
+    assert_contains "$ROOT_DIR/debian/changelog" "sing-gateway (0.1.0)"
+    assert_not_contains "$ROOT_DIR/debian/changelog" "0.1.0-1"
+    assert_contains "$ROOT_DIR/LICENSE" "General Public License"
+    assert_contains "$ROOT_DIR/debian/copyright" "License: GPL-3+"
+    assert_contains "$ROOT_DIR/debian/copyright" "/usr/share/common-licenses/GPL-3"
     assert_contains "$ROOT_DIR/debian/control" "sing-box"
     assert_contains "$ROOT_DIR/debian/control" "nftables"
     assert_contains "$ROOT_DIR/debian/control" "iproute2"
@@ -869,9 +885,20 @@ test_gateway_enable_disable() {
     case_dir="$WORKDIR/gateway-enable"
     write_gateway_fixture "$case_dir" "$gateway_config_single"
 
+    FAKE_SING_BOX_CHECK_FAIL=1
+    export FAKE_SING_BOX_CHECK_FAIL
+    run_gateway gateway-enable enable
+    assert_status 1 "$LAST_STATUS" "enable invalid clean state"
+    assert_contains "$LAST_STDERR" "sing-box config validation failed"
+    assert_file_not_exists "$case_dir/sing-box.service.d/10-sing-gateway.conf"
+    assert_file_not_exists "$case_dir/enabled"
+
+    reset_fake_env
     run_gateway gateway-enable enable
     assert_status 0 "$LAST_STATUS" "enable valid"
     assert_file_exists "$case_dir/sing-box.service.d/10-sing-gateway.conf"
+    assert_symlink_target "$case_dir/sing-box.service.d/10-sing-gateway.conf" "$case_dir/template.conf"
+    assert_file_exists "$case_dir/enabled"
     assert_contains "$case_dir/sing-box.service.d/10-sing-gateway.conf" "ExecStartPre=+/usr/bin/sing-gateway check"
     assert_contains "$LAST_LOG" "systemctl daemon-reload"
     assert_not_contains "$LAST_LOG" "systemctl restart"
@@ -881,23 +908,77 @@ test_gateway_enable_disable() {
     reset_fake_env
     FAKE_SING_BOX_CHECK_FAIL=1
     export FAKE_SING_BOX_CHECK_FAIL
-    rm -f "$case_dir/sing-box.service.d/10-sing-gateway.conf"
     run_gateway gateway-enable enable
     assert_status 1 "$LAST_STATUS" "enable invalid"
-    assert_file_not_exists "$case_dir/sing-box.service.d/10-sing-gateway.conf"
+    assert_symlink_target "$case_dir/sing-box.service.d/10-sing-gateway.conf" "$case_dir/template.conf"
+    assert_file_exists "$case_dir/enabled"
+    assert_contains "$case_dir/enabled" "NF_TABLE='sg_test'"
 
-    run_gateway gateway-enable enable --force
-    assert_status 0 "$LAST_STATUS" "force enable"
-    assert_file_exists "$case_dir/sing-box.service.d/10-sing-gateway.conf"
-    assert_contains "$case_dir/sing-box.service.d/10-sing-gateway.conf" "ExecStartPre=+/usr/bin/sing-gateway check"
+    cat > "$case_dir/gateway.conf" <<EOF
+SING_BOX_CONFIG_FILE=$case_dir/config.json
+STACK=v6
+NF_TABLE=changed_table
+ROUTE_TABLE4=300
+ROUTE_TABLE6=306
+ROUTE_MARK=0x33
+EOF
 
     reset_fake_env
     run_gateway gateway-enable disable
     assert_status 0 "$LAST_STATUS" "disable"
     assert_file_not_exists "$case_dir/sing-box.service.d/10-sing-gateway.conf"
+    assert_file_not_exists "$case_dir/enabled"
     assert_contains "$LAST_LOG" "nft delete table inet sg_test"
-    assert_contains "$LAST_LOG" "systemctl daemon-reload"
+    assert_contains "$LAST_LOG" "ip rule del fwmark 0x20 table 200"
+    assert_contains "$LAST_LOG" "ip -6 rule del fwmark 0x20 table 206"
+    assert_not_contains "$LAST_LOG" "changed_table"
+    assert_not_contains "$LAST_LOG" "0x33"
+    assert_not_contains "$LAST_LOG" "300"
+    assert_not_contains "$LAST_LOG" "306"
     assert_not_contains "$LAST_LOG" "systemctl restart"
+
+    rm -f "$case_dir/enabled"
+    mkdir -p "$case_dir/sing-box.service.d"
+    ln -s "$case_dir/template.conf" "$case_dir/sing-box.service.d/10-sing-gateway.conf"
+
+    reset_fake_env
+    run_gateway gateway-enable disable
+    assert_status 0 "$LAST_STATUS" "disable without state"
+    assert_file_not_exists "$case_dir/sing-box.service.d/10-sing-gateway.conf"
+    assert_not_contains "$LAST_LOG" "nft delete table inet"
+    assert_not_contains "$LAST_LOG" "ip rule del fwmark"
+    assert_not_contains "$LAST_LOG" "ip -6 rule del fwmark"
+    assert_not_contains "$LAST_LOG" "sing-box"
+    assert_contains "$LAST_LOG" "systemctl daemon-reload"
+
+    run_gateway gateway-enable enable --force
+    assert_status 0 "$LAST_STATUS" "force enable"
+    assert_file_exists "$case_dir/sing-box.service.d/10-sing-gateway.conf"
+    assert_symlink_target "$case_dir/sing-box.service.d/10-sing-gateway.conf" "$case_dir/template.conf"
+    assert_file_exists "$case_dir/enabled"
+    assert_contains "$case_dir/sing-box.service.d/10-sing-gateway.conf" "ExecStartPre=+/usr/bin/sing-gateway check"
+}
+
+test_gateway_enable_refuses_unmanaged_dropin() {
+    reset_fake_env
+    case_dir="$WORKDIR/gateway-enable-unmanaged"
+    write_gateway_fixture "$case_dir" "$gateway_config_single"
+
+    mkdir -p "$case_dir/sing-box.service.d"
+    printf 'unmanaged drop-in\n' > "$case_dir/sing-box.service.d/10-sing-gateway.conf"
+    run_gateway gateway-enable-unmanaged enable
+    assert_status 1 "$LAST_STATUS" "enable unmanaged file"
+    assert_contains "$LAST_STDERR" "refusing to replace unmanaged drop-in"
+    assert_contains "$case_dir/sing-box.service.d/10-sing-gateway.conf" "unmanaged drop-in"
+    assert_file_not_exists "$case_dir/enabled"
+
+    rm -f "$case_dir/sing-box.service.d/10-sing-gateway.conf"
+    ln -s /tmp/unmanaged-dropin "$case_dir/sing-box.service.d/10-sing-gateway.conf"
+    run_gateway gateway-enable-unmanaged enable
+    assert_status 1 "$LAST_STATUS" "enable unmanaged symlink"
+    assert_contains "$LAST_STDERR" "refusing to replace unmanaged drop-in"
+    assert_symlink_target "$case_dir/sing-box.service.d/10-sing-gateway.conf" "/tmp/unmanaged-dropin"
+    assert_file_not_exists "$case_dir/enabled"
 }
 
 test_gateway_discovery_and_safety() {
@@ -988,14 +1069,81 @@ test_gateway_lifecycle_delegation() {
 
 test_maintainer_scripts() {
     reset_fake_env
+    case_dir="$WORKDIR/maintainer"
+    mkdir -p "$case_dir/bin"
+    cat > "$case_dir/bin/sing-gateway" <<'EOF'
+#!/bin/sh
+printf 'sing-gateway %s\n' "$*" >> "$FAKE_LOG"
+exit 0
+EOF
+    chmod +x "$case_dir/bin/sing-gateway"
+
     assert_contains "$ROOT_DIR/debian/prerm" "remove|deconfigure"
     assert_contains "$ROOT_DIR/debian/prerm" "sing-gateway disable"
+    assert_contains "$ROOT_DIR/debian/prerm" '[ -f "$STATE_FILE" ]'
     assert_contains "$ROOT_DIR/debian/prerm" "upgrade|failed-upgrade"
     assert_not_contains "$ROOT_DIR/debian/prerm" "systemctl restart"
     assert_not_contains "$ROOT_DIR/debian/prerm" "systemctl start"
+
+    FAKE_LOG="$case_dir/prerm.log"
+    export FAKE_LOG
+    : > "$FAKE_LOG"
+    PATH="$case_dir/bin:$FAKE_BIN:$ORIG_PATH" \
+    SING_GATEWAY_STATE_FILE="$case_dir/enabled" \
+    sh "$ROOT_DIR/debian/prerm" remove
+    assert_file_empty "$FAKE_LOG"
+
+    printf 'STATE=enabled\n' > "$case_dir/enabled"
+    PATH="$case_dir/bin:$FAKE_BIN:$ORIG_PATH" \
+    SING_GATEWAY_STATE_FILE="$case_dir/enabled" \
+    sh "$ROOT_DIR/debian/prerm" remove
+    assert_contains "$FAKE_LOG" "sing-gateway disable"
+
     assert_contains "$ROOT_DIR/debian/postrm" "purge"
-    assert_contains "$ROOT_DIR/debian/postrm" "rm -rf /etc/sing-gateway"
+    assert_contains "$ROOT_DIR/debian/postrm" 'rm -f "$STATE_FILE"'
+    assert_contains "$ROOT_DIR/debian/postrm" 'rmdir "$state_dir" 2>/dev/null || true'
+    assert_contains "$ROOT_DIR/debian/postrm" 'rmdir "$CONFIG_DIR" 2>/dev/null || true'
+    assert_not_contains "$ROOT_DIR/debian/postrm" "rm -rf /etc/sing-gateway"
     assert_not_contains "$ROOT_DIR/debian/postrm" "systemctl restart"
+
+    mkdir -p "$case_dir/var/lib/sing-gateway" "$case_dir/etc/sing-gateway" \
+        "$case_dir/etc/systemd/system/sing-box.service.d" "$case_dir/usr/lib/sing-gateway/sing-box.service.d"
+    state_file="$case_dir/var/lib/sing-gateway/enabled"
+    dropin_file="$case_dir/etc/systemd/system/sing-box.service.d/10-sing-gateway.conf"
+    dropin_target="$case_dir/usr/lib/sing-gateway/sing-box.service.d/10-sing-gateway.conf"
+    : > "$dropin_target"
+    ln -s "$dropin_target" "$dropin_file"
+    printf keep > "$case_dir/etc/sing-gateway/admin.keep"
+    cat > "$state_file" <<EOF
+DROPIN_FILE='$dropin_file'
+DROPIN_TARGET='$dropin_target'
+EOF
+    FAKE_LOG="$case_dir/postrm.log"
+    export FAKE_LOG
+    : > "$FAKE_LOG"
+    PATH="$FAKE_BIN:$ORIG_PATH" \
+    SING_GATEWAY_STATE_FILE="$state_file" \
+    SING_GATEWAY_DROPIN_FILE="$dropin_file" \
+    SING_GATEWAY_DROPIN_TEMPLATE="$dropin_target" \
+    SING_GATEWAY_CONFIG_DIR="$case_dir/etc/sing-gateway" \
+    sh "$ROOT_DIR/debian/postrm" purge
+    assert_file_not_exists "$state_file"
+    assert_file_not_exists "$dropin_file"
+    assert_file_exists "$case_dir/etc/sing-gateway/admin.keep"
+    assert_contains "$FAKE_LOG" "systemctl daemon-reload"
+
+    unrelated_target="$case_dir/unrelated.conf"
+    mkdir -p "$case_dir/var/lib/sing-gateway" "$case_dir/etc/systemd/system/sing-box.service.d"
+    : > "$unrelated_target"
+    ln -s "$unrelated_target" "$dropin_file"
+    : > "$state_file"
+    PATH="$FAKE_BIN:$ORIG_PATH" \
+    SING_GATEWAY_STATE_FILE="$state_file" \
+    SING_GATEWAY_DROPIN_FILE="$dropin_file" \
+    SING_GATEWAY_DROPIN_TEMPLATE="$dropin_target" \
+    SING_GATEWAY_CONFIG_DIR="$case_dir/etc/sing-gateway" \
+    sh "$ROOT_DIR/debian/postrm" purge
+    assert_symlink_target "$dropin_file" "$unrelated_target"
 }
 
 main() {
@@ -1029,6 +1177,7 @@ main() {
     run_test "sing-gateway package layout" test_gateway_package_layout
     run_test "sing-gateway check and diagnostics" test_gateway_check_and_diagnostics
     run_test "sing-gateway enable and disable" test_gateway_enable_disable
+    run_test "sing-gateway enable refuses unmanaged drop-in" test_gateway_enable_refuses_unmanaged_dropin
     run_test "sing-gateway discovery and safety" test_gateway_discovery_and_safety
     run_test "sing-gateway lifecycle delegation" test_gateway_lifecycle_delegation
     run_test "sing-gateway maintainer scripts" test_maintainer_scripts

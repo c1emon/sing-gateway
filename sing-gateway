@@ -13,6 +13,7 @@ CTRL=${SING_GATEWAY_CTRL:-$LIB_DIR/tproxy_ctrl.sh}
 DROPIN_TEMPLATE=${SING_GATEWAY_DROPIN_TEMPLATE:-$LIB_DIR/sing-box.service.d/10-sing-gateway.conf}
 DROPIN_DIR=${SING_GATEWAY_DROPIN_DIR:-/etc/systemd/system/sing-box.service.d}
 DROPIN_FILE=${SING_GATEWAY_DROPIN_FILE:-$DROPIN_DIR/10-sing-gateway.conf}
+STATE_FILE=${SING_GATEWAY_STATE_FILE:-/var/lib/sing-gateway/enabled}
 SERVICE=${SING_GATEWAY_SERVICE:-sing-box.service}
 
 SING_BOX_BIN=${SING_BOX_BIN:-sing-box}
@@ -62,7 +63,7 @@ Commands:
 
 Environment overrides for tests/packaging: SING_GATEWAY_CONFIG, SING_GATEWAY_CTRL,
 SING_GATEWAY_LIB_DIR, SING_GATEWAY_DROPIN_TEMPLATE, SING_GATEWAY_DROPIN_DIR,
-SING_GATEWAY_DROPIN_FILE, SING_GATEWAY_SERVICE.
+SING_GATEWAY_DROPIN_FILE, SING_GATEWAY_STATE_FILE, SING_GATEWAY_SERVICE.
 EOF
 }
 
@@ -314,6 +315,52 @@ run_ctrl() {
     "$CTRL" "$action" "$@" $(ctrl_args)
 }
 
+state_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\''/g")"
+}
+
+write_state_var() {
+    name=$1
+    value=$2
+    printf '%s=' "$name"
+    state_quote "$value"
+    printf '\n'
+}
+
+write_enabled_state() {
+    state_dir=${STATE_FILE%/*}
+    [ "$state_dir" != "$STATE_FILE" ] || state_dir=.
+    mkdir -p "$state_dir"
+    tmp=$state_dir/.enabled.$$
+    {
+        write_state_var STACK "$STACK"
+        write_state_var NF_TABLE "$NF_TABLE"
+        write_state_var ROUTE_TABLE4 "$ROUTE_TABLE4"
+        write_state_var ROUTE_TABLE6 "$ROUTE_TABLE6"
+        write_state_var ROUTE_MARK "$ROUTE_MARK"
+        write_state_var TPROXY_PORT "$TPROXY_PORT"
+        write_state_var DROPIN_FILE "$DROPIN_FILE"
+        write_state_var DROPIN_TARGET "$DROPIN_TEMPLATE"
+    } > "$tmp" || { rm -f "$tmp"; die "failed to write enabled state: $STATE_FILE"; }
+    chmod 0644 "$tmp" || { rm -f "$tmp"; die "failed to set enabled state permissions: $STATE_FILE"; }
+    mv "$tmp" "$STATE_FILE" || { rm -f "$tmp"; die "failed to install enabled state: $STATE_FILE"; }
+}
+
+load_enabled_state() {
+    [ -f "$STATE_FILE" ] || return 1
+    # shellcheck disable=SC1090
+    . "$STATE_FILE"
+    DROPIN_TARGET=${DROPIN_TARGET:-$DROPIN_TEMPLATE}
+    TPROXY_PORT=${TPROXY_PORT:-9898}
+    return 0
+}
+
+dropin_is_managed() {
+    [ -L "$DROPIN_FILE" ] || return 1
+    actual=$(readlink "$DROPIN_FILE" 2>/dev/null || true)
+    [ "$actual" = "${DROPIN_TARGET:-$DROPIN_TEMPLATE}" ]
+}
+
 show_check() {
     cat <<EOF
 sing-gateway configuration OK
@@ -340,10 +387,27 @@ EOF
 install_dropin() {
     [ -f "$DROPIN_TEMPLATE" ] || die "drop-in template not found: $DROPIN_TEMPLATE"
     mkdir -p "$DROPIN_DIR"
-    tmp=$DROPIN_FILE.$$
-    cp "$DROPIN_TEMPLATE" "$tmp"
-    chmod 0644 "$tmp"
-    mv "$tmp" "$DROPIN_FILE"
+    DROPIN_TARGET=$DROPIN_TEMPLATE
+    if [ -e "$DROPIN_FILE" ] || [ -L "$DROPIN_FILE" ]; then
+        if dropin_is_managed; then
+            rm -f "$DROPIN_FILE"
+        else
+            die "refusing to replace unmanaged drop-in: $DROPIN_FILE"
+        fi
+    fi
+    ln -s "$DROPIN_TEMPLATE" "$DROPIN_FILE"
+}
+
+remove_managed_dropin() {
+    DROPIN_TARGET=${DROPIN_TARGET:-$DROPIN_TEMPLATE}
+    if [ -e "$DROPIN_FILE" ] || [ -L "$DROPIN_FILE" ]; then
+        if dropin_is_managed; then
+            rm -f "$DROPIN_FILE"
+            return 0
+        fi
+        printf 'WARNING: leaving unmanaged drop-in in place: %s\n' "$DROPIN_FILE" >&2
+    fi
+    return 1
 }
 
 daemon_reload() {
@@ -362,8 +426,11 @@ cmd_enable() {
     require_root
     if [ "$force" != 1 ]; then
         resolve_full
+    else
+        resolve_cleanup
     fi
     install_dropin
+    write_enabled_state
     daemon_reload
     printf 'sing-gateway integration enabled for %s.\n' "$SERVICE"
     printf 'Restart sing-box to apply: systemctl restart %s\n' "$SERVICE"
@@ -371,10 +438,21 @@ cmd_enable() {
 
 cmd_disable() {
     require_root
-    rm -f "$DROPIN_FILE"
-    resolve_cleanup
-    run_ctrl unset >/dev/null 2>&1 || true
-    daemon_reload
+    state_exists=0
+    dropin_changed=0
+    if load_enabled_state; then
+        state_exists=1
+    fi
+    if remove_managed_dropin; then
+        dropin_changed=1
+    fi
+    if [ "$state_exists" = 1 ]; then
+        run_ctrl unset >/dev/null 2>&1 || true
+        rm -f "$STATE_FILE"
+    fi
+    if [ "$dropin_changed" = 1 ] || [ "$state_exists" = 1 ]; then
+        daemon_reload
+    fi
     printf 'sing-gateway integration disabled for %s.\n' "$SERVICE"
     printf 'sing-box was not started or restarted.\n'
 }

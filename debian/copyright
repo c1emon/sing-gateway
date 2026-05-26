@@ -4,9 +4,11 @@ Source: local repository checkout
 
 Files: *
 Copyright: 2026 sing-gateway maintainers
-License: all-rights-reserved
- No license grant has been declared in this repository.
+License: GPL-3+
+ This program is free software: you can redistribute it and/or modify it under
+ the terms of the GNU General Public License as published by the Free Software
+ Foundation, either version 3 of the License, or (at your option) any later
+ version.
  .
- This Debian metadata records the current copyright status for local package
- builds and inspection only. Add the upstream project license here before any
- public redistribution of package artifacts.
+ On Debian systems, the complete text of the GNU General Public License version
+ 3 can be found in `/usr/share/common-licenses/GPL-3`.
