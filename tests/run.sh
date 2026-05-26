@@ -1,8 +1,8 @@
 #!/bin/sh
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-CTRL="$ROOT_DIR/tproxy_ctrl.sh"
-GATEWAY="$ROOT_DIR/sing-gateway"
+CTRL="$ROOT_DIR/scripts/tproxy_ctrl.sh"
+GATEWAY="$ROOT_DIR/scripts/sing-gateway"
 
 WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/tproxy-ctrl-test.XXXXXX")
 FAKE_BIN="$WORKDIR/bin"
@@ -829,10 +829,11 @@ test_gateway_package_layout() {
     assert_file_exists "$ROOT_DIR/debian/postrm"
     assert_file_exists "$ROOT_DIR/packaging/gateway.conf"
     assert_file_exists "$ROOT_DIR/packaging/sing-box.service.d/10-sing-gateway.conf"
-    assert_file_exists "$ROOT_DIR/sing-gateway"
+    assert_file_exists "$ROOT_DIR/scripts/sing-gateway"
+    assert_file_exists "$ROOT_DIR/scripts/tproxy_ctrl.sh"
 
-    assert_contains "$ROOT_DIR/debian/install" "tproxy_ctrl.sh usr/lib/sing-gateway/"
-    assert_contains "$ROOT_DIR/debian/install" "sing-gateway usr/bin/"
+    assert_contains "$ROOT_DIR/debian/install" "scripts/tproxy_ctrl.sh usr/lib/sing-gateway/"
+    assert_contains "$ROOT_DIR/debian/install" "scripts/sing-gateway usr/bin/"
     assert_contains "$ROOT_DIR/debian/install" "packaging/gateway.conf etc/sing-gateway/"
     assert_not_contains "$ROOT_DIR/debian/install" "docs/sing-gateway.md usr/share/doc/sing-gateway/"
     assert_contains "$ROOT_DIR/debian/source/format" "3.0 (native)"
