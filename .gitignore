@@ -12,6 +12,7 @@ update_config.sh
 .openspec/
 
 # Editor and OS files
+.vscode/
 .DS_Store
 *.swp
 *.swo

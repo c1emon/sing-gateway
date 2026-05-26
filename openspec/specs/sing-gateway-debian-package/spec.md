@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Inert Debian companion package installation
-The package SHALL install `sing-gateway` as a Debian companion package for sing-box without enabling gateway integration or mutating host network state during installation, and its Debian metadata SHALL be complete enough to build the binary package with standard Debian tooling.
+The package SHALL install `sing-gateway` as a Debian companion package for sing-box without enabling gateway integration or mutating host network state during installation, and its Debian metadata SHALL be complete enough to build the binary package with standard Debian tooling from source scripts stored under a dedicated source directory.
 
 #### Scenario: Install leaves integration inactive
 - **WHEN** the user installs the `sing-gateway` Debian package
@@ -17,6 +17,12 @@ The package SHALL install `sing-gateway` as a Debian companion package for sing-
 - **WHEN** a maintainer builds the package with standard Debian binary package tooling
 - **THEN** required Debian metadata such as package control information, changelog, copyright information, build rules, and file installation rules are present
 - **AND** the build produces a `sing-gateway` binary package without relying on a custom package assembler
+
+#### Scenario: Source scripts install to stable package paths
+- **WHEN** the package is built from source scripts stored under `scripts/`
+- **THEN** the package installs `scripts/sing-gateway` as `/usr/bin/sing-gateway`
+- **AND** it installs `scripts/tproxy_ctrl.sh` as `/usr/lib/sing-gateway/tproxy_ctrl.sh`
+- **AND** the package remains architecture-independent
 
 ### Requirement: State-backed managed integration tracking
 The `sing-gateway` CLI SHALL persist enabled integration state under `/var/lib/sing-gateway/` so later cleanup uses the parameters that were active when integration was enabled.
