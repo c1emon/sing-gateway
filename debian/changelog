@@ -1,0 +1,5 @@
+sing-gateway (0.1.0) unstable; urgency=medium
+
+  * Initial Debian companion package build.
+
+ -- sing-gateway maintainers <maintainers@example.invalid>  Tue, 26 May 2026 00:00:00 +0000

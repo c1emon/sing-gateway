@@ -8,6 +8,9 @@ update_config.sh
 .opencode/package-lock.json
 .opencode/bun.lock
 
+# OpenSpec local state/cache (keep openspec/ tracked)
+.openspec/
+
 # Editor and OS files
 .DS_Store
 *.swp

@@ -1,0 +1,4 @@
+tproxy_ctrl.sh usr/lib/sing-gateway/
+sing-gateway usr/bin/
+packaging/gateway.conf etc/sing-gateway/
+packaging/sing-box.service.d/10-sing-gateway.conf usr/lib/sing-gateway/sing-box.service.d/

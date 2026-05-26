@@ -19,7 +19,10 @@
 ## 文件说明
 
 - `tproxy_ctrl.sh`：主控制脚本，用于设置和清理 TProxy 相关规则。
+- `sing-gateway`：Debian companion package 的用户入口，用于发现 sing-box 配置、验证并委托 `tproxy_ctrl.sh`。
+- `packaging/`、`debian/`：`sing-gateway` 包的默认配置、systemd drop-in 模板和 Debian 打包元数据。
 - `tests/run.sh`：无外部依赖的 POSIX shell 回归测试套件。
+- `Makefile`：可选维护者辅助入口，`make deb` 仅委托标准 Debian 构建工具。
 
 ## 使用方法
 
@@ -86,6 +89,98 @@ sudo sh tproxy_ctrl.sh unset
 ```
 
 ## systemd 集成
+
+Debian 系统上推荐使用 `sing-gateway` companion package 提供的显式启用流程。安装包本身是惰性的，不会创建 active drop-in、重启 sing-box、调用 nftables、修改路由或修改 sysctl。
+
+典型流程：
+
+```sh
+sudo sing-gateway check
+sudo sing-gateway print-command
+sudo sing-gateway print-nft
+sudo sing-gateway enable
+sudo systemctl restart sing-box.service
+```
+
+`sing-gateway enable` 会验证配置，把 `/etc/systemd/system/sing-box.service.d/10-sing-gateway.conf` 创建为指向 `/usr/lib/sing-gateway/sing-box.service.d/10-sing-gateway.conf` 的受管 symlink，写入 `/var/lib/sing-gateway/enabled` 作为后续清理依据，执行 `systemctl daemon-reload`，并提示用户重启 sing-box；它不会自动启动或重启 sing-box。需要临时跳过启用前验证时可使用 `sing-gateway enable --force`，但服务启动时仍会通过 `ExecStartPre=+sing-gateway check` 失败关闭。`--force` 只跳过启用前验证；清理 state 仍来自 `gateway.conf` 中显式配置的值或默认值，而不是完整解析后的 sing-box 配置。
+
+禁用集成：
+
+```sh
+sudo sing-gateway disable
+```
+
+该命令只会移除指向打包模板的受管 symlink，并且仅在 `/var/lib/sing-gateway/enabled` 存在时才使用其中记录的启用时参数清理 nftables/策略路由状态；不会根据当前 `gateway.conf` 推断清理目标，也不会删除普通文件或无关 symlink。更多 Debian 包说明见 `docs/sing-gateway.md`。
+
+## Debian 包构建与检查
+
+在 Debian/Ubuntu 构建环境中安装维护者工具：
+
+```sh
+sudo apt-get update
+sudo apt-get install --no-install-recommends \
+  build-essential devscripts debhelper lintian dpkg-dev
+```
+
+标准构建路径以 `debian/` 元数据为唯一事实来源：
+
+```sh
+dpkg-buildpackage -us -uc -b
+```
+
+安装 `devscripts` 后也可以使用等价命令：
+
+```sh
+debuild -us -uc -b
+```
+
+可选的本地辅助命令 `make deb` 只是调用 `dpkg-buildpackage -us -uc -b`，不会复制包元数据或文件列表。
+
+构建产物会写入仓库父目录，通常包括：
+
+```text
+../sing-gateway_<version>_all.deb
+../sing-gateway_<version>_<arch>.changes
+../sing-gateway_<version>_<arch>.buildinfo
+```
+
+安装前检查包元数据、文件列表和 lintian 输出：
+
+```sh
+test "$(cat debian/source/format)" = "3.0 (native)"
+dpkg-parsechangelog --show-field Version | grep -v -- '-'
+grep -R "GPL-3+" LICENSE debian/copyright
+dpkg-deb --info ../sing-gateway_*_all.deb
+dpkg-deb --contents ../sing-gateway_*_all.deb
+lintian ../sing-gateway_<version>_<arch>.changes ../sing-gateway_*_all.deb
+```
+
+`debian/source/format` 应为 `3.0 (native)`，`debian/changelog` 版本不应包含 Debian revision 后缀（例如 `-1`），项目 `LICENSE` 与 `debian/copyright` 应声明 GPL-3+，并在 Debian 版权元数据中指向 `/usr/share/common-licenses/GPL-3`。`dpkg-deb --info` 应展示包名、版本、架构、依赖、维护者和描述；文件列表应包含 CLI、控制脚本、默认配置、文档和 systemd drop-in 模板。
+
+建议只在一次性 Debian/Ubuntu VM 或容器中测试安装生命周期：
+
+```sh
+sudo apt-get install ./../sing-gateway_*_all.deb
+test ! -e /etc/systemd/system/sing-box.service.d/10-sing-gateway.conf
+command -v sing-gateway
+dpkg -L sing-gateway
+sudo sing-gateway enable
+test -L /etc/systemd/system/sing-box.service.d/10-sing-gateway.conf
+test "$(readlink /etc/systemd/system/sing-box.service.d/10-sing-gateway.conf)" = "/usr/lib/sing-gateway/sing-box.service.d/10-sing-gateway.conf"
+test -f /var/lib/sing-gateway/enabled
+sudo apt-get remove sing-gateway
+test ! -e /etc/systemd/system/sing-box.service.d/10-sing-gateway.conf
+sudo install -d /etc/sing-gateway
+printf keep | sudo tee /etc/sing-gateway/admin.keep >/dev/null
+sudo apt-get purge sing-gateway
+test -f /etc/sing-gateway/admin.keep
+sudo rm -f /etc/sing-gateway/admin.keep
+rmdir /etc/sing-gateway 2>/dev/null || true
+```
+
+还应验证没有 `/var/lib/sing-gateway/enabled` 时执行 package remove 不会调用 `sing-gateway disable`、`tproxy_ctrl.sh unset`、nftables 或策略路由清理。安装包必须保持惰性：安装时不创建 active drop-in、不启动或重启 sing-box、不调用 nftables、不修改路由或 sysctl。只有显式运行 `sing-gateway enable` 才会启用集成；remove/purge 清理路径也不应启动或重启服务。purge 只用 `rmdir` 清理空目录，不会递归删除 `/etc/sing-gateway` 中的管理员文件。
+
+### 手动 drop-in
 
 如果使用发行版或上游提供的 `sing-box.service`，建议通过 systemd drop-in 添加规则，不直接修改原始 service 文件，以保持升级兼容性：
 

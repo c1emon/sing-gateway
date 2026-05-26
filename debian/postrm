@@ -1,0 +1,44 @@
+#!/bin/sh
+set -e
+
+STATE_FILE=${SING_GATEWAY_STATE_FILE:-/var/lib/sing-gateway/enabled}
+DROPIN_FILE=${SING_GATEWAY_DROPIN_FILE:-/etc/systemd/system/sing-box.service.d/10-sing-gateway.conf}
+DROPIN_TARGET=${SING_GATEWAY_DROPIN_TEMPLATE:-/usr/lib/sing-gateway/sing-box.service.d/10-sing-gateway.conf}
+CONFIG_DIR=${SING_GATEWAY_CONFIG_DIR:-/etc/sing-gateway}
+
+state_dir=${STATE_FILE%/*}
+[ "$state_dir" != "$STATE_FILE" ] || state_dir=.
+dropin_dir=${DROPIN_FILE%/*}
+[ "$dropin_dir" != "$DROPIN_FILE" ] || dropin_dir=.
+
+remove_managed_dropin() {
+    [ -f "$STATE_FILE" ] && . "$STATE_FILE"
+    if [ -L "$DROPIN_FILE" ]; then
+        actual=$(readlink "$DROPIN_FILE" 2>/dev/null || true)
+        if [ "$actual" = "$DROPIN_TARGET" ]; then
+            rm -f "$DROPIN_FILE"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+case "$1" in
+    purge)
+        dropin_changed=0
+        if remove_managed_dropin; then
+            dropin_changed=1
+        fi
+        rm -f "$STATE_FILE"
+        rmdir "$state_dir" 2>/dev/null || true
+        rmdir "$CONFIG_DIR" 2>/dev/null || true
+        rmdir "$dropin_dir" 2>/dev/null || true
+        if [ "$dropin_changed" = 1 ] && command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
