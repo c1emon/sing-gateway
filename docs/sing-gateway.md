@@ -14,6 +14,9 @@ drop-in, restart sing-box, call nftables, change routes, or alter sysctl values.
 - `/var/lib/sing-gateway/enabled` - created only by `sing-gateway enable`; this
   state file is the authority for managed cleanup parameters.
 
+In the source checkout, the executable script sources live under `scripts/`;
+Debian package installation keeps the stable installed paths listed above.
+
 ## Building the Debian package
 
 Builds use standard Debian metadata under `debian/` as the source of truth.
@@ -73,6 +76,7 @@ and description. The file layout should include `/usr/bin/sing-gateway`,
 `/usr/lib/sing-gateway/sing-box.service.d/`, the
 `/etc/sing-gateway/gateway.conf` conffile, and documentation under
 `/usr/share/doc/sing-gateway/`.
+Moving source scripts under `scripts/` must not change these installed paths.
 
 ## Package lifecycle validation
 

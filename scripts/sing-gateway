@@ -276,6 +276,19 @@ resolve_full() {
 resolve_cleanup() {
     load_config
     TPROXY_PORT=${TPROXY_PORT:-9898}
+    FAKEIP_V4=
+    FAKEIP_V6=
+    HIJACK_DNS=0
+    PROXY_LOCAL=0
+    IGNORE_MARK=
+    IGNORE_UID=
+}
+
+resolve_enabled_cleanup() {
+    if load_enabled_state; then
+        return 0
+    fi
+    resolve_cleanup
 }
 
 ctrl_args() {
@@ -350,6 +363,11 @@ load_enabled_state() {
     [ -f "$STATE_FILE" ] || return 1
     # shellcheck disable=SC1090
     . "$STATE_FILE"
+    STACK=${STACK:-v4}
+    NF_TABLE=${NF_TABLE:-transparent_proxy}
+    ROUTE_TABLE4=${ROUTE_TABLE4:-100}
+    ROUTE_TABLE6=${ROUTE_TABLE6:-106}
+    ROUTE_MARK=${ROUTE_MARK:-0x01}
     DROPIN_TARGET=${DROPIN_TARGET:-$DROPIN_TEMPLATE}
     TPROXY_PORT=${TPROXY_PORT:-9898}
     return 0
@@ -463,7 +481,7 @@ case "$ACTION" in
     print-command) resolve_full; print_ctrl_command set 0 ;;
     print-nft) resolve_full; run_ctrl set --dry-run ;;
     set) resolve_full; if ! run_ctrl set; then resolve_cleanup; run_ctrl unset >/dev/null 2>&1 || true; exit 1; fi ;;
-    unset) resolve_cleanup; run_ctrl unset ;;
+    unset) resolve_enabled_cleanup; run_ctrl unset ;;
     enable) cmd_enable "$@" ;;
     disable) cmd_disable "$@" ;;
     *) die "unknown command: $ACTION" ;;

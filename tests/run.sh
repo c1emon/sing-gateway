@@ -1,8 +1,8 @@
 #!/bin/sh
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-CTRL="$ROOT_DIR/tproxy_ctrl.sh"
-GATEWAY="$ROOT_DIR/sing-gateway"
+CTRL="$ROOT_DIR/scripts/tproxy_ctrl.sh"
+GATEWAY="$ROOT_DIR/scripts/sing-gateway"
 
 WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/tproxy-ctrl-test.XXXXXX")
 FAKE_BIN="$WORKDIR/bin"
@@ -368,7 +368,7 @@ write_gateway_fixture() {
 [Service]
 ExecStartPre=+/usr/bin/sing-gateway check
 ExecStartPost=+/usr/bin/sing-gateway set
-ExecStopPost=+/usr/bin/sing-gateway unset
+ExecStopPost=+-/usr/bin/sing-gateway unset
 EOF
     printf '%s\n' "$config_json" > "$case_dir/config.json"
     cat > "$case_dir/gateway.conf" <<EOF
@@ -829,10 +829,11 @@ test_gateway_package_layout() {
     assert_file_exists "$ROOT_DIR/debian/postrm"
     assert_file_exists "$ROOT_DIR/packaging/gateway.conf"
     assert_file_exists "$ROOT_DIR/packaging/sing-box.service.d/10-sing-gateway.conf"
-    assert_file_exists "$ROOT_DIR/sing-gateway"
+    assert_file_exists "$ROOT_DIR/scripts/sing-gateway"
+    assert_file_exists "$ROOT_DIR/scripts/tproxy_ctrl.sh"
 
-    assert_contains "$ROOT_DIR/debian/install" "tproxy_ctrl.sh usr/lib/sing-gateway/"
-    assert_contains "$ROOT_DIR/debian/install" "sing-gateway usr/bin/"
+    assert_contains "$ROOT_DIR/debian/install" "scripts/tproxy_ctrl.sh usr/lib/sing-gateway/"
+    assert_contains "$ROOT_DIR/debian/install" "scripts/sing-gateway usr/bin/"
     assert_contains "$ROOT_DIR/debian/install" "packaging/gateway.conf etc/sing-gateway/"
     assert_not_contains "$ROOT_DIR/debian/install" "docs/sing-gateway.md usr/share/doc/sing-gateway/"
     assert_contains "$ROOT_DIR/debian/source/format" "3.0 (native)"
@@ -849,7 +850,7 @@ test_gateway_package_layout() {
     assert_contains "$ROOT_DIR/debian/control" "systemd"
     assert_contains "$ROOT_DIR/packaging/sing-box.service.d/10-sing-gateway.conf" "ExecStartPre=+/usr/bin/sing-gateway check"
     assert_contains "$ROOT_DIR/packaging/sing-box.service.d/10-sing-gateway.conf" "ExecStartPost=+/usr/bin/sing-gateway set"
-    assert_contains "$ROOT_DIR/packaging/sing-box.service.d/10-sing-gateway.conf" "ExecStopPost=+/usr/bin/sing-gateway unset"
+    assert_contains "$ROOT_DIR/packaging/sing-box.service.d/10-sing-gateway.conf" "ExecStopPost=+-/usr/bin/sing-gateway unset"
 }
 
 test_gateway_check_and_diagnostics() {
@@ -991,7 +992,7 @@ test_gateway_discovery_and_safety() {
 [Service]
 ExecStartPre=+/usr/bin/sing-gateway check
 ExecStartPost=+/usr/bin/sing-gateway set
-ExecStopPost=+/usr/bin/sing-gateway unset
+ExecStopPost=+-/usr/bin/sing-gateway unset
 EOF
     printf '%s\n' "$gateway_config_single" > "$case_dir/config.json"
     cat > "$case_dir/gateway.conf" <<EOF
@@ -1065,6 +1066,81 @@ test_gateway_lifecycle_delegation() {
     assert_status 0 "$LAST_STATUS" "gateway unset"
     assert_contains "$LAST_LOG" "nft delete table inet sg_test"
     assert_contains "$LAST_LOG" "ip rule del fwmark 0x20 table 200"
+}
+
+test_gateway_unset_uses_enabled_state() {
+    reset_fake_env
+    case_dir="$WORKDIR/gateway-unset-state"
+    write_gateway_fixture "$case_dir" "$gateway_config_single"
+
+    run_gateway gateway-unset-state enable
+    assert_status 0 "$LAST_STATUS" "enable writes cleanup state"
+
+    cat > "$case_dir/gateway.conf" <<EOF
+SING_BOX_CONFIG_FILE=$case_dir/config.json
+STACK=v6
+NF_TABLE=changed_table
+ROUTE_TABLE4=300
+ROUTE_TABLE6=306
+ROUTE_MARK=0x33
+PROXY_LOCAL=1
+EOF
+
+    reset_fake_env
+    run_gateway gateway-unset-state unset
+    assert_status 0 "$LAST_STATUS" "unset uses persisted state"
+    assert_contains "$LAST_LOG" "nft delete table inet sg_test"
+    assert_contains "$LAST_LOG" "ip rule del fwmark 0x20 table 200"
+    assert_contains "$LAST_LOG" "ip -6 rule del fwmark 0x20 table 206"
+    assert_not_contains "$LAST_LOG" "changed_table"
+    assert_not_contains "$LAST_LOG" "0x33"
+    assert_not_contains "$LAST_LOG" "300"
+    assert_not_contains "$LAST_LOG" "306"
+}
+
+test_gateway_unset_tolerates_empty_enabled_state() {
+    reset_fake_env
+    case_dir="$WORKDIR/gateway-unset-empty-state"
+    write_gateway_fixture "$case_dir" "$gateway_config_single"
+
+    : > "$case_dir/enabled"
+    cat > "$case_dir/gateway.conf" <<EOF
+SING_BOX_CONFIG_FILE=$case_dir/config.json
+PROXY_LOCAL=1
+EOF
+
+    run_gateway gateway-unset-empty-state unset
+    assert_status 0 "$LAST_STATUS" "unset tolerates empty enabled state"
+    assert_contains "$LAST_LOG" "nft delete table inet transparent_proxy"
+    assert_contains "$LAST_LOG" "ip rule del fwmark 0x01 table 100"
+    assert_not_contains "$LAST_STDERR" "proxy-local requires"
+}
+
+test_gateway_unset_without_state_ignores_set_only_options() {
+    reset_fake_env
+    case_dir="$WORKDIR/gateway-unset-no-state-set-options"
+    write_gateway_fixture "$case_dir" "$gateway_config_single"
+
+    rm -f "$case_dir/enabled"
+    cat > "$case_dir/gateway.conf" <<EOF
+SING_BOX_CONFIG_FILE=$case_dir/config.json
+STACK=all
+NF_TABLE=sg_test
+ROUTE_TABLE4=200
+ROUTE_TABLE6=206
+ROUTE_MARK=0x20
+TPROXY_PORT=9898
+FAKEIP_V4=198.18.0.0/15
+HIJACK_DNS=1
+PROXY_LOCAL=1
+EOF
+
+    run_gateway gateway-unset-no-state-set-options unset
+    assert_status 0 "$LAST_STATUS" "unset without state ignores set-only options"
+    assert_contains "$LAST_LOG" "nft delete table inet sg_test"
+    assert_contains "$LAST_LOG" "ip rule del fwmark 0x20 table 200"
+    assert_contains "$LAST_LOG" "ip -6 rule del fwmark 0x20 table 206"
+    assert_not_contains "$LAST_STDERR" "proxy-local requires"
 }
 
 test_maintainer_scripts() {
@@ -1180,6 +1256,9 @@ main() {
     run_test "sing-gateway enable refuses unmanaged drop-in" test_gateway_enable_refuses_unmanaged_dropin
     run_test "sing-gateway discovery and safety" test_gateway_discovery_and_safety
     run_test "sing-gateway lifecycle delegation" test_gateway_lifecycle_delegation
+    run_test "sing-gateway unset uses enabled state" test_gateway_unset_uses_enabled_state
+    run_test "sing-gateway unset tolerates empty enabled state" test_gateway_unset_tolerates_empty_enabled_state
+    run_test "sing-gateway unset without state ignores set-only options" test_gateway_unset_without_state_ignores_set_only_options
     run_test "sing-gateway maintainer scripts" test_maintainer_scripts
 
     printf '\nSummary: %d passed, %d failed, %d skipped, %d total\n' "$PASS" "$FAIL" "$SKIP" "$TOTAL"

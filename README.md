@@ -18,8 +18,8 @@
 
 ## 文件说明
 
-- `tproxy_ctrl.sh`：主控制脚本，用于设置和清理 TProxy 相关规则。
-- `sing-gateway`：Debian companion package 的用户入口，用于发现 sing-box 配置、验证并委托 `tproxy_ctrl.sh`。
+- `scripts/tproxy_ctrl.sh`：主控制脚本源码，用于设置和清理 TProxy 相关规则。
+- `scripts/sing-gateway`：Debian companion package 的用户入口源码，用于发现 sing-box 配置、验证并委托 `tproxy_ctrl.sh`。
 - `packaging/`、`debian/`：`sing-gateway` 包的默认配置、systemd drop-in 模板和 Debian 打包元数据。
 - `tests/run.sh`：无外部依赖的 POSIX shell 回归测试套件。
 - `Makefile`：可选维护者辅助入口，`make deb` 仅委托标准 Debian 构建工具。
@@ -29,37 +29,37 @@
 查看帮助：
 
 ```sh
-sh tproxy_ctrl.sh --help
+sh scripts/tproxy_ctrl.sh --help
 ```
 
 以 dry-run 方式生成默认 IPv4 规则：
 
 ```sh
-sh tproxy_ctrl.sh set --dry-run
+sh scripts/tproxy_ctrl.sh set --dry-run
 ```
 
 以 dry-run 方式生成双栈 nftables 规则：
 
 ```sh
-sh tproxy_ctrl.sh set --stack=all --dry-run
+sh scripts/tproxy_ctrl.sh set --stack=all --dry-run
 ```
 
 将生成的 nftables 规则保存到文件：
 
 ```sh
-sh tproxy_ctrl.sh set --stack=all --save=./tproxy.nft --dry-run
+sh scripts/tproxy_ctrl.sh set --stack=all --save=./tproxy.nft --dry-run
 ```
 
 应用 IPv4 TProxy 路由：
 
 ```sh
-sudo sh tproxy_ctrl.sh set --stack=v4
+sudo sh scripts/tproxy_ctrl.sh set --stack=v4
 ```
 
 应用双栈 TProxy 路由，并启用 DNS 劫持和 FakeIP 路由：
 
 ```sh
-sudo sh tproxy_ctrl.sh set \
+sudo sh scripts/tproxy_ctrl.sh set \
   --stack=all \
   --hijack-dns \
   --fake-ip4=198.18.0.0/15 \
@@ -69,7 +69,7 @@ sudo sh tproxy_ctrl.sh set \
 代理本机发出的流量，并通过 ignore mark 避免回环：
 
 ```sh
-sudo sh tproxy_ctrl.sh set \
+sudo sh scripts/tproxy_ctrl.sh set \
   --proxy-local \
   --ignore-mark=0x20
 ```
@@ -77,7 +77,7 @@ sudo sh tproxy_ctrl.sh set \
 代理本机发出的流量，并绕过指定 UID 的代理进程：
 
 ```sh
-sudo sh tproxy_ctrl.sh set \
+sudo sh scripts/tproxy_ctrl.sh set \
   --proxy-local \
   --ignore-uid=1000
 ```
@@ -85,7 +85,7 @@ sudo sh tproxy_ctrl.sh set \
 清理脚本管理的 nftables 和路由状态：
 
 ```sh
-sudo sh tproxy_ctrl.sh unset
+sudo sh scripts/tproxy_ctrl.sh unset
 ```
 
 ## systemd 集成
