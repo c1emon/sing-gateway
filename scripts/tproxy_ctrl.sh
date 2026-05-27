@@ -263,68 +263,65 @@ is_ipv4_cidr() {
     done
 }
 
+is_ipv6_hextet() {
+    case "$1" in
+        ''|*[!0-9A-Fa-f]*) return 1 ;;
+    esac
+    [ "${#1}" -le 4 ]
+}
+
+count_ipv6_part_hextets() {
+    part=$1
+    IPV6_PART_COUNT=0
+
+    [ -n "$part" ] || return 0
+
+    case "$part" in
+        :*|*:|*::* ) return 1 ;;
+    esac
+
+    old_ifs=$IFS
+    IFS=:
+    set -- $part
+    IFS=$old_ifs
+
+    for seg do
+        is_ipv6_hextet "$seg" || return 1
+        IPV6_PART_COUNT=$((IPV6_PART_COUNT + 1))
+    done
+}
+
 is_ipv6_cidr() {
-    # 检查是否包含CIDR后缀
     case "$1" in
         */*) ;;
         *) return 1 ;;
     esac
 
-    # 分割IP和CIDR部分
     ip_part="${1%/*}"
     cidr="${1#*/}"
 
-    # 验证CIDR是否为0-128之间的数字
-    if ! ( [ "$cidr" -eq "$cidr" ] 2>/dev/null && [ "$cidr" -ge 0 ] && [ "$cidr" -le 128 ] ); then
-        return 1
-    fi
+    [ -n "$ip_part" ] || return 1
+    is_uint_range "$cidr" 0 128 || return 1
 
-    # 检查IPv6地址部分的合法性
-    case $ip_part in
-        # 允许双冒号出现一次，并替换以计算段数
-        *::*)
-            if [ "$(echo "$ip_part" | tr -cd ':' | wc -c)" -gt 7 ]; then
-                return 1  # 超过7个冒号不合法
-            fi
-            temp=$(echo "$ip_part" | sed 's/::/:/g')  # 替换双冒号为单冒号
-            ;;
-        *)
-            temp="$ip_part"
-            ;;
+    case "$ip_part" in
+        *[!0-9A-Fa-f:]*|*:::*|*::*::*) return 1 ;;
     esac
 
-    # 分割段并检查每段格式
-    IFS=':'
-    set -- $temp
-    IFS=
-    segment_count=0
-    for seg do
-        segment_count=$((segment_count + 1))
-        # 空段仅在双冒号处允许
-        if [ -z "$seg" ] && [ "$segment_count" -ne 1 ] && [ "$segment_count" -ne $# ]; then
-            return 1
-        fi
-        # 每段必须是1-4位十六进制数
-        if ! echo "$seg" | grep -qE '^[0-9a-fA-F]{1,4}$'; then
-            return 1
-        fi
-    done
-
-    # 根据是否包含双冒号验证段数
-    case $ip_part in
+    case "$ip_part" in
         *::*)
-            if [ $segment_count -gt 8 ]; then
-                return 1
-            fi
+            left=${ip_part%%::*}
+            right=${ip_part#*::}
+            count_ipv6_part_hextets "$left" || return 1
+            left_count=$IPV6_PART_COUNT
+            count_ipv6_part_hextets "$right" || return 1
+            right_count=$IPV6_PART_COUNT
+            [ $((left_count + right_count)) -lt 8 ] || return 1
             ;;
         *)
-            if [ $segment_count -ne 8 ]; then
-                return 1
-            fi
+            count_ipv6_part_hextets "$ip_part" || return 1
+            [ "$IPV6_PART_COUNT" -eq 8 ] || return 1
             ;;
     esac
-
-    return 0
 }
 
 check() {
