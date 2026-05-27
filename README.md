@@ -44,6 +44,21 @@ sh scripts/tproxy_ctrl.sh set --dry-run
 sh scripts/tproxy_ctrl.sh set --stack=all --dry-run
 ```
 
+以生产网关方式限定入口接口、保护本机服务并启用 FakeIP/DNS 审计：
+
+```sh
+sh scripts/tproxy_ctrl.sh set \
+  --stack=all \
+  --in-iface=eth0 \
+  --local-addr4=127.0.0.1,10.0.0.10 \
+  --local-tcp-ports=22,7890,9898 \
+  --local-udp-ports=53 \
+  --dns-bypass4=10.0.0.10 \
+  --fake-ip4=198.18.0.0/15 \
+  --hijack-dns \
+  --dry-run
+```
+
 将生成的 nftables 规则保存到文件：
 
 ```sh
@@ -232,6 +247,14 @@ TProxy 参数：
 - `--proxy-local`：重路由本机 output 流量。
 - `--ignore-mark=<MARK>`：绕过带有该 mark 的本机 output 流量。
 - `--ignore-uid=<UID>`：绕过来自该 UID 的本机 output 流量。
+- `--in-iface=<iface[,iface...]>`：入口接口 allow-list；配置后 prerouting/divert 只处理指定接口进入的流量。
+- `--bypass4=<CIDR[,CIDR...]>` / `--bypass6=<CIDR[,CIDR...]>`：自定义 nft/kernel bypass 目的网段。该 bypass 不等同于 sing-box `direct` outbound。
+- `--local-addr4=<IP[,IP...]>` / `--local-addr6=<IP[,IP...]>`：绕过本机/网关服务地址。
+- `--dns-bypass4=<IP[,IP...]>` / `--dns-bypass6=<IP[,IP...]>`：绕过本地、内部或管理 DNS 目的地址。
+- `--local-tcp-ports=<PORT[,PORT...]>` / `--local-udp-ports=<PORT[,PORT...]>`：绕过管理端口、显式代理端口、TPROXY listener、健康检查端口等本机服务端口。
+- `--dns-bypass-ports=<PORT[,PORT...]>`：DNS hijack/reroute 匹配端口，默认 `53`。
+- `--rp-filter=off|check|loose|strict|disable`：IPv4 rp_filter 策略（仅作用于 `net.ipv4.conf.*`）；默认不处理，`check` 发现 strict 值会失败，`loose`/`disable` 会显式写入安全值。
+- `--enable-kernel-bypass`：显式启用 kernel bypass 所需 forwarding sysctl。基础 TPROXY 本地路由不再无条件开启 forwarding。
 
 FakeIP 与 DNS 参数：
 
@@ -245,7 +268,18 @@ FakeIP 与 DNS 参数：
 - 非 dry-run 的 `set` 会调用 `nft`、`ip` 和 `sysctl`，可能改变主机路由和防火墙状态。
 - `unset` 会移除脚本管理的 nftables 表和策略路由，但不会关闭 IPv4 或 IPv6 转发。
 - `--proxy-local` 必须配合 `--ignore-mark` 或 `--ignore-uid` 使用；否则脚本会拒绝执行，以避免本机代理回环。
+- `--proxy-local` 的 `--ignore-mark` 不能与 `--route-mark` 相同。
+- FakeIP CIDR 会优先于 private/custom bypass 进入 TPROXY；与 `--bypass4/6` 完全相同的 FakeIP CIDR 会被拒绝。
+- 启用 `--hijack-dns` 前应通过本地地址/端口或 `--dns-bypass4/6` 排除已由 OPNsense DNAT 到 W:53 的 DNS listener 以及内部 DNS/AD/管理 DNS。
 - 如果 nftables 规则已应用但路由设置失败，脚本会尝试回滚脚本管理的 nftables 表。
+
+### OPNsense 单臂网关注意事项
+
+- FakeIP PBR：OPNsense 应将 FakeIP 目标网段策略路由到 Proxy Gateway VIP，同时避免将代理网关自身流量再次 PBR 回代理。
+- DNS DNAT：如果 OPNsense 已将 `VIP:53` DNAT 到 W 的 DNS listener，Linux 侧必须把 W 的 DNS 地址/端口作为本机服务或 DNS bypass 先接受，不应让 `--hijack-dns` 再次捕获。
+- Bogon/anti-spoofing：`198.18.0.0/15` 等 FakeIP/测试网段可能被 bogon 规则拦截；需要在 OPNsense 上为相关接口和 PBR/NAT 路径配置例外。
+- PMTUD/ICMP：脚本默认先接受非 TCP/UDP 流量，以保留 ICMP、ICMPv6、ND/RA/MLD 和 PMTUD 控制流量；上游防火墙也不应阻断这些控制报文。
+- Kernel bypass：只有使用 `--enable-kernel-bypass` 时才期望 Linux 转发被 nft accept 的绕过流量；同时需要 OPNsense NAT、防火墙、anti-spoofing 和 PBR 防环路规则配套。
 
 ## 测试
 

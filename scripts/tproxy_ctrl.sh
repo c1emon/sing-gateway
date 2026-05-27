@@ -4,14 +4,31 @@ set -e
 
 ACTION=""
 STACK="v4"
+
+# Feature toggles derived from CLI options during validation.
 ENABLE_FAKEIP="0"
 ENABLE_FAKEIP_V4="0"
 ENABLE_FAKEIP_V6="0"
 PROXY_LOCAL="0"
 HIJACK_DNS="0"
+ENABLE_KERNEL_BYPASS="0"
+RP_FILTER="off"
 
+# Local-output loop prevention knobs for --proxy-local.
 IGNORE_MARK=""
 IGNORE_UID=""
+
+# Optional capture scope and bypass inputs. CSV values are rendered into nft sets.
+IN_IFACE=""
+BYPASS4=""
+BYPASS6=""
+LOCAL_ADDR4=""
+LOCAL_ADDR6=""
+DNS_BYPASS4=""
+DNS_BYPASS6=""
+LOCAL_TCP_PORTS=""
+LOCAL_UDP_PORTS=""
+DNS_BYPASS_PORTS="53"
 
 NF_TABLE="transparent_proxy"
 TPROXY_PORT="9898"
@@ -49,6 +66,18 @@ usage() {
     printf '  %-25s %-20s\n' "--proxy-local" "Proxy local traffic (Default false)"
     printf '  %-25s %-20s\n' "--ignore-mark=<MARK>" "Ignore traffic of special mark (available when --proxy-local set)"
     printf '  %-25s %-20s\n' "--ignore-uid=<UID>" "Ignore traffic of special uid (available when --proxy-local set)"
+    printf '  %-25s %-20s\n' "--in-iface=<iface[,iface...]>" "Allow-list ingress interfaces"
+    printf '  %-25s %-20s\n' "--bypass4=<cidr[,cidr...]>" "Bypass ipv4 CIDRs"
+    printf '  %-25s %-20s\n' "--bypass6=<cidr[,cidr...]>" "Bypass ipv6 CIDRs"
+    printf '  %-25s %-20s\n' "--local-addr4=<csv>" "Bypass local ipv4 addresses"
+    printf '  %-25s %-20s\n' "--local-addr6=<csv>" "Bypass local ipv6 addresses"
+    printf '  %-25s %-20s\n' "--dns-bypass4=<csv>" "Bypass local DNS ipv4 addresses"
+    printf '  %-25s %-20s\n' "--dns-bypass6=<csv>" "Bypass local DNS ipv6 addresses"
+    printf '  %-25s %-20s\n' "--local-tcp-ports=<csv>" "Bypass local TCP ports"
+    printf '  %-25s %-20s\n' "--local-udp-ports=<csv>" "Bypass local UDP ports"
+    printf '  %-25s %-20s\n' "--dns-bypass-ports=<csv>" "Bypass local DNS ports (default 53)"
+    printf '  %-25s %-20s\n' "--rp-filter=off|check|loose|strict|disable" "Set rp_filter policy"
+    printf '  %-25s %-20s\n' "--enable-kernel-bypass" "Apply forwarding sysctls"
     printf "\nOptions (fakeip):\n"
     printf '  %-25s %-20s\n' "--fake-ip4=<IPV4>" "Set fakeip ipv4 cidr (available when ipv4 enabled)"
     printf '  %-25s %-20s\n' "--fake-ip6=<IPV6>" "Set fakeip ipv6 cidr (available when ipv6 enabled)"
@@ -91,6 +120,127 @@ is_nft_identifier() {
         ''|[0-9]*|*[!A-Za-z0-9_]*) return 1 ;;
         *) return 0 ;;
     esac
+}
+
+is_iface_name() {
+    case "$1" in
+        ''|*[!A-Za-z0-9_.:-]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+is_ipv4_token() {
+    # Lightweight nft token filter for address lists; nft remains final parser.
+    case "$1" in
+        *.*.*.*|*.*.*.*/*) ;;
+        *) return 1 ;;
+    esac
+    case "$1" in
+        *[!0-9./]*) return 1 ;;
+    esac
+}
+
+is_ipv6_token() {
+    # Lightweight nft token filter for address lists; nft remains final parser.
+    case "$1" in
+        *:*) ;;
+        *) return 1 ;;
+    esac
+    case "$1" in
+        *[!0-9A-Fa-f:./%]*) return 1 ;;
+    esac
+}
+
+csv_to_nft_list() {
+    # Convert comma-separated CLI values into nft set syntax elements.
+    out=""
+    sep=""
+    old_ifs=$IFS
+    IFS=,
+    for item in $1; do
+        out=$out$sep$item
+        sep=", "
+    done
+    IFS=$old_ifs
+    printf '%s' "$out"
+}
+
+validate_csv_with() {
+    values=$1
+    label=$2
+    checker=$3
+    old_ifs=$IFS
+    IFS=,
+    for item in $values; do
+        if [ -z "$item" ] || ! $checker "$item"; then
+            IFS=$old_ifs
+            echo "ERROR: invalid $label: \"$values\""
+            usage
+            exit 1
+        fi
+    done
+    IFS=$old_ifs
+}
+
+csv_contains_exact() {
+    values=$1
+    needle=$2
+    old_ifs=$IFS
+    IFS=,
+    for item in $values; do
+        if [ "$item" = "$needle" ]; then
+            IFS=$old_ifs
+            return 0
+        fi
+    done
+    IFS=$old_ifs
+    return 1
+}
+
+validate_ipv4_cidr_csv() { validate_csv_with "$1" "$2" is_ipv4_cidr; }
+validate_ipv6_cidr_csv() { validate_csv_with "$1" "$2" is_ipv6_cidr; }
+validate_iface_csv() { validate_csv_with "$1" "$2" is_iface_name; }
+validate_port_csv() { validate_csv_with "$1" "$2" is_uint_port; }
+
+is_uint_port() {
+    is_uint_range "$1" 1 65535
+}
+
+validate_ipv4_addr_csv() {
+    values=$1
+    label=$2
+    old_ifs=$IFS
+    IFS=,
+    for item in $values; do
+        case "$item" in
+            *.*.*.*|*.*.*.*/*) is_ipv4_token "$item" || { IFS=$old_ifs; echo "ERROR: invalid $label: \"$values\""; usage; exit 1; } ;;
+            *) IFS=$old_ifs; echo "ERROR: invalid $label: \"$values\""; usage; exit 1 ;;
+        esac
+    done
+    IFS=$old_ifs
+}
+
+validate_ipv6_addr_csv() {
+    values=$1
+    label=$2
+    old_ifs=$IFS
+    IFS=,
+    for item in $values; do
+        is_ipv6_token "$item" || { IFS=$old_ifs; echo "ERROR: invalid $label: \"$values\""; usage; exit 1; }
+    done
+    IFS=$old_ifs
+}
+
+validate_rp_filter() {
+    case "$1" in
+        off|check|loose|strict|disable) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+csv_or_empty() {
+    [ -n "$1" ] || return 0
+    printf '%s' "$1"
 }
 
 is_ipv4_cidr() {
@@ -178,14 +328,13 @@ is_ipv6_cidr() {
 }
 
 check() {
-    # check ACTION
+    # Validate all user input before writing files or touching nft/ip/sysctl.
     if [ -z "$ACTION" ]; then
         echo "ERROR: invalid action"
         usage
         exit 1
     fi
 
-    # check STACK
     case $STACK in
         v4|v6|all)
             ;;
@@ -196,7 +345,7 @@ check() {
             ;;
     esac
 
-    # check NF_TABLE is a safe unquoted nftables identifier
+    # NF_TABLE is emitted unquoted in nft syntax, so keep it identifier-only.
     if ! is_nft_identifier "$NF_TABLE"; then
         echo "ERROR: invalid nf table: \"$NF_TABLE\""
         usage
@@ -214,6 +363,25 @@ check() {
         exit 1
     fi
 
+    if ! validate_rp_filter "$RP_FILTER"; then
+        echo "ERROR: invalid rp_filter policy: \"$RP_FILTER\""
+        usage
+        exit 1
+    fi
+
+    if [ -n "$IN_IFACE" ]; then
+        validate_iface_csv "$IN_IFACE" "in-iface"
+    fi
+    [ -z "$BYPASS4" ] || validate_ipv4_cidr_csv "$BYPASS4" "bypass4"
+    [ -z "$BYPASS6" ] || validate_ipv6_cidr_csv "$BYPASS6" "bypass6"
+    [ -z "$LOCAL_ADDR4" ] || validate_ipv4_addr_csv "$LOCAL_ADDR4" "local-addr4"
+    [ -z "$LOCAL_ADDR6" ] || validate_ipv6_addr_csv "$LOCAL_ADDR6" "local-addr6"
+    [ -z "$DNS_BYPASS4" ] || validate_ipv4_addr_csv "$DNS_BYPASS4" "dns-bypass4"
+    [ -z "$DNS_BYPASS6" ] || validate_ipv6_addr_csv "$DNS_BYPASS6" "dns-bypass6"
+    [ -z "$LOCAL_TCP_PORTS" ] || validate_port_csv "$LOCAL_TCP_PORTS" "local-tcp-ports"
+    [ -z "$LOCAL_UDP_PORTS" ] || validate_port_csv "$LOCAL_UDP_PORTS" "local-udp-ports"
+    [ -z "$DNS_BYPASS_PORTS" ] || validate_port_csv "$DNS_BYPASS_PORTS" "dns-bypass-ports"
+
     if [ -n "$FAKEIP_V4" ]; then
         if is_ipv4_cidr "$FAKEIP_V4"; then
             case $STACK in
@@ -227,6 +395,23 @@ check() {
             usage
             exit 1
         fi
+    fi
+
+    if [ "$PROXY_LOCAL" = "1" ] && [ -n "$IGNORE_MARK" ] && [ "$IGNORE_MARK" = "$ROUTE_MARK" ]; then
+        echo "ERROR: --proxy-local conflicts with ignore-mark equal to route-mark"
+        usage
+        exit 1
+    fi
+
+    if [ -n "$FAKEIP_V4" ] && [ -n "$BYPASS4" ] && csv_contains_exact "$BYPASS4" "$FAKEIP_V4"; then
+        echo "ERROR: fakeip v4 conflicts with bypass4"
+        usage
+        exit 1
+    fi
+    if [ -n "$FAKEIP_V6" ] && [ -n "$BYPASS6" ] && csv_contains_exact "$BYPASS6" "$FAKEIP_V6"; then
+        echo "ERROR: fakeip v6 conflicts with bypass6"
+        usage
+        exit 1
     fi
 
     if [ -n "$FAKEIP_V6" ]; then
@@ -244,21 +429,21 @@ check() {
         fi
     fi
 
-    # check ROUTE_MARK is a valid uint32 mark in decimal or hex
+    # ROUTE_MARK is a valid uint32 mark in decimal or hex.
     if ! is_mark "$ROUTE_MARK"; then
         echo "ERROR: invalid route mark: \"$ROUTE_MARK\""
         usage
         exit 1
     fi
 
-    # check TPROXY_PORT is valid TCP/UDP port
+    # TPROXY_PORT is a valid TCP/UDP port.
     if ! is_uint_range "$TPROXY_PORT" 1 65535; then
         echo "ERROR: invalid tproxy port: \"$TPROXY_PORT\""
         usage
         exit 1
     fi
 
-    # check PROXY_LOCAL
+    # Local output proxying must exclude the proxy process to avoid loops.
     if [ "$PROXY_LOCAL" = "1" ]; then
         if [ -z "$IGNORE_MARK" ] && [ -z "$IGNORE_UID" ]; then
             echo "ERROR: --proxy-local requires --ignore-mark or --ignore-uid to avoid local proxy loops"
@@ -314,6 +499,42 @@ while [ "$1" != "" ]; do
         --proxy-local)
             PROXY_LOCAL="1"
             ;;
+        --in-iface)
+            IN_IFACE=$VALUE
+            ;;
+        --bypass4)
+            BYPASS4=$VALUE
+            ;;
+        --bypass6)
+            BYPASS6=$VALUE
+            ;;
+        --local-addr4)
+            LOCAL_ADDR4=$VALUE
+            ;;
+        --local-addr6)
+            LOCAL_ADDR6=$VALUE
+            ;;
+        --dns-bypass4)
+            DNS_BYPASS4=$VALUE
+            ;;
+        --dns-bypass6)
+            DNS_BYPASS6=$VALUE
+            ;;
+        --local-tcp-ports)
+            LOCAL_TCP_PORTS=$VALUE
+            ;;
+        --local-udp-ports)
+            LOCAL_UDP_PORTS=$VALUE
+            ;;
+        --dns-bypass-ports)
+            DNS_BYPASS_PORTS=$VALUE
+            ;;
+        --rp-filter)
+            RP_FILTER=$VALUE
+            ;;
+        --enable-kernel-bypass)
+            ENABLE_KERNEL_BYPASS="1"
+            ;;
         --ignore-mark)
             IGNORE_MARK=$VALUE
             ;;
@@ -351,52 +572,119 @@ check
 
 
 gen_nft_rule() {
+    # Build a deterministic policy pipeline:
+    # scope -> non-TCP/UDP/local bypass -> FakeIP -> DNS hijack -> bypass -> TPROXY.
+    SCOPE_GUARD=""
+    LOCAL_BYPASS_RULES=""
+    BYPASS_RULES=""
     DNS_PRE=""
-    DNS_PRE_CHAIN=""
-    DNS_OUTPUT=""
-    DNS_OUTPUT_CHAIN=""
+    DNS_CHAIN=""
+    OUTPUT_PRE_RULES=""
+    OUTPUT_DNS_RULES=""
 
-    DIRECT_V4_RULE=""
-    DIRECT_V6_RULE=""
     TPROXY_V4_RULE=""
     TPROXY_V6_RULE=""
 
     case $STACK in
         v4|all)
-            DIRECT_V4_RULE="meta nfproto ipv4 ip daddr @private counter accept comment \"private IPv4\""
             TPROXY_V4_RULE="meta nfproto ipv4 meta l4proto { tcp, udp } meta mark set $ROUTE_MARK tproxy ip to :$TPROXY_PORT counter accept"
             ;;
     esac
     case $STACK in
         v6|all)
-            DIRECT_V6_RULE="meta nfproto ipv6 ip6 daddr @private6 counter accept comment \"private IPv6\""
             TPROXY_V6_RULE="meta nfproto ipv6 meta l4proto { tcp, udp } meta mark set $ROUTE_MARK tproxy ip6 to :$TPROXY_PORT counter accept"
             ;;
     esac
 
+    if [ -n "$IN_IFACE" ]; then
+        # Allow-list mode: packets from non-selected interfaces leave untouched.
+        SCOPE_GUARD="iifname != { $(csv_to_nft_list "$IN_IFACE") } counter accept comment \"ingress scope\""
+    fi
+
+    # Local service and infrastructure bypasses are shared by prerouting and output.
+    if [ -n "$LOCAL_ADDR4" ]; then
+        LOCAL_BYPASS_RULES=$LOCAL_BYPASS_RULES"
+            meta nfproto ipv4 ip daddr { $(csv_to_nft_list "$LOCAL_ADDR4") } counter accept comment \"local IPv4\""
+        OUTPUT_PRE_RULES=$OUTPUT_PRE_RULES"
+            meta nfproto ipv4 ip daddr { $(csv_to_nft_list "$LOCAL_ADDR4") } counter accept comment \"local IPv4\""
+    fi
+    if [ -n "$LOCAL_ADDR6" ]; then
+        LOCAL_BYPASS_RULES=$LOCAL_BYPASS_RULES"
+            meta nfproto ipv6 ip6 daddr { $(csv_to_nft_list "$LOCAL_ADDR6") } counter accept comment \"local IPv6\""
+        OUTPUT_PRE_RULES=$OUTPUT_PRE_RULES"
+            meta nfproto ipv6 ip6 daddr { $(csv_to_nft_list "$LOCAL_ADDR6") } counter accept comment \"local IPv6\""
+    fi
+    if [ -n "$LOCAL_TCP_PORTS" ]; then
+        LOCAL_BYPASS_RULES=$LOCAL_BYPASS_RULES"
+            meta l4proto tcp th dport { $(csv_to_nft_list "$LOCAL_TCP_PORTS") } counter accept comment \"local TCP\""
+        OUTPUT_PRE_RULES=$OUTPUT_PRE_RULES"
+            meta l4proto tcp th dport { $(csv_to_nft_list "$LOCAL_TCP_PORTS") } counter accept comment \"local TCP\""
+    fi
+    if [ -n "$LOCAL_UDP_PORTS" ]; then
+        LOCAL_BYPASS_RULES=$LOCAL_BYPASS_RULES"
+            meta l4proto udp th dport { $(csv_to_nft_list "$LOCAL_UDP_PORTS") } counter accept comment \"local UDP\""
+        OUTPUT_PRE_RULES=$OUTPUT_PRE_RULES"
+            meta l4proto udp th dport { $(csv_to_nft_list "$LOCAL_UDP_PORTS") } counter accept comment \"local UDP\""
+    fi
+    if [ -n "$DNS_BYPASS4" ]; then
+        LOCAL_BYPASS_RULES=$LOCAL_BYPASS_RULES"
+            meta nfproto ipv4 ip daddr { $(csv_to_nft_list "$DNS_BYPASS4") } counter accept comment \"dns bypass IPv4\""
+        OUTPUT_PRE_RULES=$OUTPUT_PRE_RULES"
+            meta nfproto ipv4 ip daddr { $(csv_to_nft_list "$DNS_BYPASS4") } counter accept comment \"dns bypass IPv4\""
+    fi
+    if [ -n "$DNS_BYPASS6" ]; then
+        LOCAL_BYPASS_RULES=$LOCAL_BYPASS_RULES"
+            meta nfproto ipv6 ip6 daddr { $(csv_to_nft_list "$DNS_BYPASS6") } counter accept comment \"dns bypass IPv6\""
+        OUTPUT_PRE_RULES=$OUTPUT_PRE_RULES"
+            meta nfproto ipv6 ip6 daddr { $(csv_to_nft_list "$DNS_BYPASS6") } counter accept comment \"dns bypass IPv6\""
+    fi
+
+    case $STACK in
+        v4|all)
+            # Private/reserved ranges stay after FakeIP so 198.18.0.0/15 can be proxied.
+            BYPASS_RULES=$BYPASS_RULES"
+            meta nfproto ipv4 ip daddr @private counter accept comment \"private IPv4\""
+            ;;
+    esac
+    case $STACK in
+        v6|all)
+            BYPASS_RULES=$BYPASS_RULES"
+            meta nfproto ipv6 ip6 daddr @private6 counter accept comment \"private IPv6\""
+            ;;
+    esac
+    if [ -n "$BYPASS4" ]; then
+        BYPASS_RULES=$BYPASS_RULES"
+            meta nfproto ipv4 ip daddr { $(csv_to_nft_list "$BYPASS4") } counter accept comment \"custom bypass IPv4\""
+    fi
+    if [ -n "$BYPASS6" ]; then
+        BYPASS_RULES=$BYPASS_RULES"
+            meta nfproto ipv6 ip6 daddr { $(csv_to_nft_list "$BYPASS6") } counter accept comment \"custom bypass IPv6\""
+    fi
+
     if [ "$HIJACK_DNS" = "1" ]; then
+        # DNS hijack is intentionally late; local/DNS bypass rules are emitted first.
         DNS_PRE="jump dns comment \"route dns\""
         DNS_PRE_V4_CHAIN=""
         DNS_PRE_V6_CHAIN=""
         case $STACK in
             v4|all)
-                DNS_PRE_V4_CHAIN="meta nfproto ipv4 meta l4proto { tcp, udp } th dport 53 meta mark set $ROUTE_MARK tproxy ip to :$TPROXY_PORT counter accept"
+                DNS_PRE_V4_CHAIN="meta nfproto ipv4 meta l4proto { tcp, udp } th dport { $(csv_to_nft_list "$DNS_BYPASS_PORTS") } meta mark set $ROUTE_MARK tproxy ip to :$TPROXY_PORT counter accept"
                 ;;
         esac
         case $STACK in
             v6|all)
-                DNS_PRE_V6_CHAIN="meta nfproto ipv6 meta l4proto { tcp, udp } th dport 53 meta mark set $ROUTE_MARK tproxy ip6 to :$TPROXY_PORT counter accept"
+                DNS_PRE_V6_CHAIN="meta nfproto ipv6 meta l4proto { tcp, udp } th dport { $(csv_to_nft_list "$DNS_BYPASS_PORTS") } meta mark set $ROUTE_MARK tproxy ip6 to :$TPROXY_PORT counter accept"
                 ;;
         esac
-        DNS_PRE_CHAIN="chain dns {
+        DNS_CHAIN="chain dns {
             $DNS_PRE_V4_CHAIN
             $DNS_PRE_V6_CHAIN
         }
 "
         if [ "$PROXY_LOCAL" = "1" ]; then
-            DNS_OUTPUT="jump reroute_dns comment \"re-route dns\""
+            OUTPUT_DNS_RULES="jump reroute_dns comment \"re-route dns\""
             DNS_OUTPUT_CHAIN="chain reroute_dns {
-            meta l4proto { tcp, udp } th dport 53 meta mark set $ROUTE_MARK counter accept
+            meta l4proto { tcp, udp } th dport { $(csv_to_nft_list "$DNS_BYPASS_PORTS") } meta mark set $ROUTE_MARK counter accept
         }
 "
         fi
@@ -425,6 +713,7 @@ gen_nft_rule() {
     FAKEIP_PRE=""
     FAKEIP_OUTPUT=""
     if [ "$ENABLE_FAKEIP" = "1" ]; then
+        # FakeIP is a capture target, not a private-range bypass.
         FAKEIP_PRE="jump fakeip comment \"route fakeip\""
         FAKEIP_PRE_CHAIN="chain fakeip {
             $FAKEIP_V4_PRE_CHAIN
@@ -452,14 +741,19 @@ gen_nft_rule() {
 
     OUTPUT_CHAIN=""
     if [ "$PROXY_LOCAL" = "1" ]; then
+        # Output reroute mirrors prerouting exclusions before marking local traffic.
         OUTPUT_CHAIN="## re-route local traffic
         chain output {
                 type route hook output priority filter; policy accept;
                 $IGNORE_MARK_RULE
                 $IGNORE_UID_RULE
-                $DNS_OUTPUT
-                $FAKEIP_OUTPUT
+                meta oifname "lo" counter accept comment \"loopback\"
                 jump direct
+                jump local_bypass
+                $OUTPUT_PRE_RULES
+                $OUTPUT_DNS_RULES
+                $FAKEIP_OUTPUT
+                jump bypass
                 meta l4proto { tcp, udp } meta mark set $ROUTE_MARK counter accept comment \"re-route\"
         }"
     fi
@@ -491,19 +785,27 @@ table inet $NF_TABLE {
         chain direct {
             meta l4proto != { tcp, udp } counter accept
             th dport 123 counter accept comment \"time sync\"
-            $DIRECT_V4_RULE
-            $DIRECT_V6_RULE
         }
 
-        $DNS_PRE_CHAIN
-        $DNS_OUTPUT_CHAIN
+        chain local_bypass {
+            $LOCAL_BYPASS_RULES
+        }
+
+        $DNS_CHAIN
         $FAKEIP_PRE_CHAIN
         $FAKEIP_OUTPUT_CHAIN
+        $DNS_OUTPUT_CHAIN
+        chain bypass {
+            $BYPASS_RULES
+        }
         chain prerouting {
-            type filter hook prerouting priority filter; policy accept;
-            $DNS_PRE
-            $FAKEIP_PRE
+            type filter hook prerouting priority -149; policy accept;
+            $SCOPE_GUARD
             jump direct
+            jump local_bypass
+            $FAKEIP_PRE
+            $DNS_PRE
+            jump bypass
             ## go to tproxy
             $TPROXY_V4_RULE
             $TPROXY_V6_RULE
@@ -513,7 +815,8 @@ table inet $NF_TABLE {
 
         ## https://ovear.info/post/509 for better performance
         chain divert {
-                type filter hook prerouting priority mangle; policy accept;
+                type filter hook prerouting priority -150; policy accept;
+                $SCOPE_GUARD
                 meta l4proto tcp socket transparent 1 meta mark set $ROUTE_MARK accept
         }
 }
@@ -521,6 +824,7 @@ table inet $NF_TABLE {
 }
 
 set_nft() {
+    # Replace only the script-managed inet table.
     nft delete table inet "$NF_TABLE" 2>/dev/null || true
     printf '%s' "$NFT_RULE" | nft -f -
 }
@@ -533,15 +837,66 @@ unset_nft() {
 }
 
 set_route4() {
-    sysctl -w net.ipv4.ip_forward=1
+    # TPROXY local routes do not require forwarding; kernel bypass opts in to it.
+    if [ "$ENABLE_KERNEL_BYPASS" = "1" ]; then
+        sysctl -w net.ipv4.ip_forward=1 || return 1
+    fi
+    apply_rp_filter_ipv4 || return 1
     ip rule show fwmark "$ROUTE_MARK" table "$ROUTE_TABLE4" | grep -q . || ip rule add fwmark "$ROUTE_MARK" table "$ROUTE_TABLE4"
     ip route replace local 0.0.0.0/0 dev lo table "$ROUTE_TABLE4"
 }
 
 set_route6() {
-    sysctl -w net.ipv6.conf.all.forwarding=1
+    if [ "$ENABLE_KERNEL_BYPASS" = "1" ]; then
+        sysctl -w net.ipv6.conf.all.forwarding=1 || return 1
+    fi
     ip -6 rule show fwmark "$ROUTE_MARK" table "$ROUTE_TABLE6" | grep -q . || ip -6 rule add fwmark "$ROUTE_MARK" table "$ROUTE_TABLE6"
     ip -6 route replace local ::/0 dev lo table "$ROUTE_TABLE6"
+}
+
+rp_filter_targets() {
+    # Linux rp_filter is IPv4-only; apply to global defaults and scoped ingress ifaces.
+    base=$1
+    printf '%s\n' "$base.all.rp_filter" "$base.default.rp_filter"
+    if [ -n "$IN_IFACE" ]; then
+        old_ifs=$IFS
+        IFS=,
+        for iface in $IN_IFACE; do
+            printf '%s\n' "$base.$iface.rp_filter"
+        done
+        IFS=$old_ifs
+    fi
+}
+
+apply_rp_filter_values() {
+    base=$1
+    value=$2
+    for target in $(rp_filter_targets "$base"); do
+        sysctl -w "$target=$value"
+    done
+}
+
+check_rp_filter_values() {
+    base=$1
+    for target in $(rp_filter_targets "$base"); do
+        current=$(sysctl -n "$target" 2>/dev/null || printf 0)
+        case "$current" in
+            1)
+                echo "ERROR: rp_filter strict value detected on $target"
+                return 1
+                ;;
+        esac
+    done
+}
+
+apply_rp_filter_ipv4() {
+    case "$RP_FILTER" in
+        off) ;;
+        check) check_rp_filter_values net.ipv4.conf ;;
+        loose) apply_rp_filter_values net.ipv4.conf 2 ;;
+        strict) apply_rp_filter_values net.ipv4.conf 1 ;;
+        disable) apply_rp_filter_values net.ipv4.conf 0 ;;
+    esac
 }
 
 set_route() {
@@ -586,12 +941,13 @@ unset_route() {
 
 case $ACTION in
     set)
+    # Apply nft first, then routing/sysctl. Roll back nft if routing setup fails.
     gen_nft_rule
     if [ "$SAVE" = "1" ]; then
-        echo "$NFT_RULE" > "$SAVE_FILE"
+        printf '%s\n' "$NFT_RULE" > "$SAVE_FILE"
     fi
     if [ "$DRY_RUN" = "1" ]; then
-        echo "$NFT_RULE"
+        printf '%s\n' "$NFT_RULE"
         exit
     fi
     set_nft

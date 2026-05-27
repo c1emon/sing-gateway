@@ -188,6 +188,51 @@ recursively deletes `/etc/sing-gateway`.
 `TPROXY_PORT`, `STACK`, `FAKEIP_V4`, `FAKEIP_V6`, `HIJACK_DNS`, `PROXY_LOCAL`,
 `IGNORE_UID`, and `IGNORE_MARK`.
 
+Gateway hardening options can also be set in `gateway.conf` and are passed
+through to `tproxy_ctrl.sh` during `check`, `print-command`, `print-nft`, and
+`set`:
+
+- `IN_IFACE` - comma-separated ingress interface allow-list, for example
+  `eth0` or `eth0,wg0`.
+- `BYPASS4` / `BYPASS6` - comma-separated kernel-bypass destination CIDRs.
+- `LOCAL_ADDR4` / `LOCAL_ADDR6` - local gateway/listener addresses to accept
+  before DNS hijack or default TPROXY.
+- `DNS_BYPASS4` / `DNS_BYPASS6` - internal, management, or DNATed DNS
+  destination addresses to accept before DNS hijack.
+- `LOCAL_TCP_PORTS` / `LOCAL_UDP_PORTS` - local service ports such as SSH,
+  explicit HTTP/SOCKS proxy ports, TPROXY listener ports, DNS listener ports, or
+  health-check ports.
+- `DNS_BYPASS_PORTS` - DNS ports matched by hijack/reroute rules; defaults to
+  `53`.
+- `RP_FILTER` - `off`, `check`, `loose`, `strict`, or `disable`; use `check` to
+  fail on unsafe strict reverse-path filtering, or `loose`/`disable` to apply
+  explicit IPv4 settings for `net.ipv4.conf.all`, `net.ipv4.conf.default`, and
+  configured ingress interfaces. Linux IPv6 does not use `rp_filter`.
+- `ENABLE_KERNEL_BYPASS` - boolean; only when enabled will the controller apply
+  forwarding sysctls needed for kernel-forwarded bypass traffic.
+
+`unset` and package cleanup remain bounded to script-managed nftables and policy
+routing state. They do not disable forwarding or restore prior `rp_filter`
+values, so operators should treat sysctl changes as explicit host networking
+configuration.
+
+## OPNsense prerequisites for single-arm proxy gateway deployments
+
+The Linux controller does not manage OPNsense. Before applying rules on a
+production topology, verify these external prerequisites:
+
+- FakeIP PBR sends configured FakeIP CIDRs to the Proxy Gateway VIP and excludes
+  the proxy gateway/proxy process path to avoid routing loops.
+- DNS DNAT from OPNsense to the Linux DNS listener is paired with Linux-side
+  `LOCAL_ADDR*`, `LOCAL_*_PORTS`, or `DNS_BYPASS*` exclusions so DNATed DNS is
+  delivered locally instead of being hijacked again.
+- Bogon and anti-spoofing policy permits deliberate FakeIP/test-net and
+  LAN-source traffic on the DMZ/service path where required.
+- ICMP/ICMPv6, PMTUD, neighbor discovery, router advertisement, and multicast
+  listener discovery are not blocked by upstream firewall policy.
+- Kernel-bypassed traffic has explicit OPNsense NAT/firewall/PBR loop-prevention
+  rules; nft `accept` is not the same thing as sing-box `direct` outbound.
+
 When no explicit sing-box source is configured, `sing-gateway` inspects
 `sing-box.service` metadata for config paths and service user, then falls back
 to `/etc/sing-box/config.json` only if that file exists.

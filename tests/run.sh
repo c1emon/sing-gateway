@@ -100,6 +100,15 @@ EOF
 cat > "$FAKE_BIN/sysctl" <<'EOF'
 #!/bin/sh
 printf 'sysctl %s\n' "$*" >> "${FAKE_LOG:-/dev/null}"
+
+if [ "$1" = "-n" ]; then
+    if [ "${FAKE_SYSCTL_READ_FAIL:-0}" = 1 ]; then
+        exit 1
+    fi
+    printf '%s\n' "${FAKE_SYSCTL_READ_VALUE:-0}"
+    exit 0
+fi
+
 exit 0
 EOF
 
@@ -208,6 +217,8 @@ reset_fake_env() {
     FAKE_CURRENT_UID=0
     FAKE_ID_SING_BOX_UID=990
     FAKE_ID_UID=1000
+    FAKE_SYSCTL_READ_VALUE=0
+    FAKE_SYSCTL_READ_FAIL=0
 
     export FAKE_NFT_DELETE_FAIL FAKE_NFT_APPLY_FAIL
     export FAKE_IP_RULE_SHOW_PRESENT FAKE_IP_RULE_SHOW_OUTPUT
@@ -215,6 +226,7 @@ reset_fake_env() {
     export FAKE_IP_ROUTE_FAIL FAKE_IP_ROUTE_DEL_FAIL
     export FAKE_SING_BOX_CHECK_FAIL FAKE_SING_BOX_MERGE_FILE
     export FAKE_SYSTEMCTL_SHOW FAKE_CURRENT_UID FAKE_ID_SING_BOX_UID FAKE_ID_UID
+    export FAKE_SYSCTL_READ_VALUE FAKE_SYSCTL_READ_FAIL
 }
 
 fail_assert() {
@@ -247,13 +259,13 @@ assert_file_empty() {
 assert_contains() {
     file=$1
     needle=$2
-    grep -F -q "$needle" "$file" || fail_assert "expected '$needle' in $file"
+    grep -F -q -- "$needle" "$file" || fail_assert "expected '$needle' in $file"
 }
 
 assert_not_contains() {
     file=$1
     needle=$2
-    if grep -F -q "$needle" "$file"; then
+    if grep -F -q -- "$needle" "$file"; then
         fail_assert "did not expect '$needle' in $file"
     fi
 }
@@ -285,7 +297,7 @@ assert_in_order() {
     shift
     prev=0
     for needle do
-        line=$(grep -nF "$needle" "$file" | awk -F: 'NR==1 { print $1 }')
+        line=$(grep -nF -- "$needle" "$file" | awk -F: 'NR==1 { print $1 }')
         [ -n "$line" ] || fail_assert "expected '$needle' in order check for $file"
         [ "$line" -gt "$prev" ] || fail_assert "expected '$needle' after previous match in $file"
         prev=$line
@@ -296,7 +308,7 @@ assert_in_order_after() {
     file=$1
     marker=$2
     shift 2
-    start=$(grep -nF "$marker" "$file" | awk -F: 'NR==1 { print $1 }')
+    start=$(grep -nF -- "$marker" "$file" | awk -F: 'NR==1 { print $1 }')
     [ -n "$start" ] || fail_assert "expected marker '$marker' in $file"
     prev=$start
     for needle do
@@ -561,6 +573,45 @@ test_fakeip_cidr_validation() {
     assert_contains "$LAST_STDOUT" "ERROR: invalid fakeip v6 cidr"
 }
 
+test_hardened_option_validation() {
+    reset_fake_env
+
+    run_ctrl iface-valid set --in-iface=eth0,wg0 --dry-run
+    assert_status 0 "$LAST_STATUS" "valid ingress iface"
+    assert_contains "$LAST_STDOUT" "ingress scope"
+
+    run_ctrl iface-invalid set --in-iface='eth0;rm' --dry-run
+    assert_status 1 "$LAST_STATUS" "invalid ingress iface"
+    assert_contains "$LAST_STDOUT" "ERROR: invalid in-iface"
+
+    run_ctrl bypass-cidr-valid set --bypass4=10.0.0.0/8,192.168.0.0/16 --bypass6=fc00::/7 --dry-run
+    assert_status 0 "$LAST_STATUS" "valid bypass cidrs"
+
+    run_ctrl bypass-cidr-invalid set --bypass4=10.0.0.0/33 --dry-run
+    assert_status 1 "$LAST_STATUS" "invalid bypass cidr"
+    assert_contains "$LAST_STDOUT" "ERROR: invalid bypass4"
+
+    run_ctrl local-bypass-valid set --local-addr4=127.0.0.1,10.0.0.10 --local-addr6=::1 --local-tcp-ports=80,8080 --local-udp-ports=53 --dns-bypass-ports=53,5353 --dry-run
+    assert_status 0 "$LAST_STATUS" "valid local bypasses"
+    assert_contains "$LAST_STDOUT" "local IPv4"
+
+    run_ctrl local-bypass-invalid-port set --local-tcp-ports=0 --dry-run
+    assert_status 1 "$LAST_STATUS" "invalid local port"
+    assert_contains "$LAST_STDOUT" "ERROR: invalid local-tcp-ports"
+
+    run_ctrl rp-filter-invalid set --rp-filter=broken --dry-run
+    assert_status 1 "$LAST_STATUS" "invalid rp_filter"
+    assert_contains "$LAST_STDOUT" "ERROR: invalid rp_filter policy"
+
+    run_ctrl proxy-local-mark-conflict set --proxy-local --ignore-mark=0x01 --dry-run
+    assert_status 1 "$LAST_STATUS" "proxy-local mark conflict"
+    assert_contains "$LAST_STDOUT" "conflicts with ignore-mark equal to route-mark"
+
+    run_ctrl fakeip-bypass-conflict set --fake-ip4=198.18.0.0/15 --bypass4=198.18.0.0/15 --dry-run
+    assert_status 1 "$LAST_STATUS" "fakeip bypass conflict"
+    assert_contains "$LAST_STDOUT" "conflicts with bypass4"
+}
+
 test_dry_run_stack_selection() {
     reset_fake_env
 
@@ -591,13 +642,13 @@ test_dns_hijack_and_local_reroute() {
     run_ctrl dns-hijack set --stack=all --hijack-dns --dry-run
     assert_status 0 "$LAST_STATUS" "dns hijack dry-run"
     assert_contains "$LAST_STDOUT" "chain dns {"
-    assert_contains "$LAST_STDOUT" "th dport 53 meta mark set 0x01 tproxy ip to :9898 counter accept"
-    assert_contains "$LAST_STDOUT" "th dport 53 meta mark set 0x01 tproxy ip6 to :9898 counter accept"
+    assert_contains "$LAST_STDOUT" "th dport { 53 } meta mark set 0x01 tproxy ip to :9898 counter accept"
+    assert_contains "$LAST_STDOUT" "th dport { 53 } meta mark set 0x01 tproxy ip6 to :9898 counter accept"
 
     run_ctrl dns-reroute-local set --stack=all --proxy-local --ignore-mark=0x20 --hijack-dns --dry-run
     assert_status 0 "$LAST_STATUS" "dns reroute dry-run"
     assert_contains "$LAST_STDOUT" "chain reroute_dns {"
-    assert_contains "$LAST_STDOUT" "th dport 53 meta mark set 0x01 counter accept"
+    assert_contains "$LAST_STDOUT" "th dport { 53 } meta mark set 0x01 counter accept"
     assert_contains "$LAST_STDOUT" "jump reroute_dns comment \"re-route dns\""
     assert_contains "$LAST_STDOUT" "chain reroute_dns {"
 }
@@ -635,13 +686,12 @@ test_proxy_local_bypass_ordering() {
     run_ctrl proxy-local-order set --stack=all --proxy-local --ignore-mark=0x20 --ignore-uid=1000 --hijack-dns --fake-ip4=198.18.0.0/15 --fake-ip6=2001:db8::/32 --dry-run
     assert_status 0 "$LAST_STATUS" "proxy-local ordering"
     assert_contains "$LAST_STDOUT" "chain output {"
-    assert_in_order_after "$LAST_STDOUT" "chain output {" \
-        "meta mark == 0x20 counter accept comment \"ignore outbound pkts by mark\"" \
-        "meta skuid == 1000 counter accept comment \"ignore outbound pkts by uid\"" \
-        "jump reroute_dns comment \"re-route dns\"" \
-        "jump reroute_fakeip comment \"re-route fakeip\"" \
-        "jump direct" \
-        "meta l4proto { tcp, udp } meta mark set 0x01 counter accept comment \"re-route\""
+    assert_contains "$LAST_STDOUT" "meta mark == 0x20 counter accept comment \"ignore outbound pkts by mark\""
+    assert_contains "$LAST_STDOUT" "meta skuid == 1000 counter accept comment \"ignore outbound pkts by uid\""
+    assert_contains "$LAST_STDOUT" "jump reroute_dns comment \"re-route dns\""
+    assert_contains "$LAST_STDOUT" "jump reroute_fakeip comment \"re-route fakeip\""
+    assert_contains "$LAST_STDOUT" "jump direct"
+    assert_contains "$LAST_STDOUT" "meta l4proto { tcp, udp } meta mark set 0x01 counter accept comment \"re-route\""
 
     run_ctrl proxy-local-mark-only set --stack=all --proxy-local --ignore-mark=0x20 --dry-run
     assert_status 0 "$LAST_STATUS" "ignore mark only"
@@ -652,6 +702,36 @@ test_proxy_local_bypass_ordering() {
     assert_status 0 "$LAST_STATUS" "ignore uid only"
     assert_contains "$LAST_STDOUT" "meta skuid == 1000 counter accept comment \"ignore outbound pkts by uid\""
     assert_not_contains "$LAST_STDOUT" "ignore outbound pkts by mark"
+}
+
+test_hardened_prerouting_and_output_order() {
+    reset_fake_env
+
+    run_ctrl hardened-order set --stack=all --in-iface=eth0,wg0 --local-addr4=127.0.0.1,10.0.0.10 --local-addr6=::1 --local-tcp-ports=80,8080 --local-udp-ports=53 --dns-bypass4=127.0.0.1 --dns-bypass6=::1 --dns-bypass-ports=53,5353 --fake-ip4=198.18.0.0/15 --fake-ip6=fc00::/18 --bypass4=10.0.0.0/8 --bypass6=fc00::/7 --hijack-dns --proxy-local --ignore-uid=1000 --dry-run
+    assert_status 0 "$LAST_STATUS" "hardened dry-run"
+    assert_contains "$LAST_STDOUT" "type filter hook prerouting priority -150"
+    assert_contains "$LAST_STDOUT" "type filter hook prerouting priority -149"
+    assert_in_order_after "$LAST_STDOUT" "chain prerouting {" \
+        "ingress scope" \
+        "jump direct" \
+        "jump local_bypass" \
+        "jump fakeip comment \"route fakeip\"" \
+        "jump dns comment \"route dns\"" \
+        "jump bypass" \
+        "meta mark set 0x01 tproxy ip to :9898 counter accept"
+    assert_in_order_after "$LAST_STDOUT" "chain output {" \
+        "ignore outbound pkts by uid" \
+        "loopback" \
+        "jump direct" \
+        "jump local_bypass" \
+        "jump reroute_dns comment \"re-route dns\"" \
+        "jump reroute_fakeip comment \"re-route fakeip\"" \
+        "jump bypass" \
+        "meta l4proto { tcp, udp } meta mark set 0x01 counter accept comment \"re-route\""
+    assert_contains "$LAST_STDOUT" "custom bypass IPv4"
+    assert_contains "$LAST_STDOUT" "private IPv4"
+    assert_contains "$LAST_STDOUT" "th dport { 53, 5353 } meta mark set 0x01 tproxy ip to :9898 counter accept"
+    assert_contains "$LAST_STDOUT" "th dport { 53, 5353 } meta mark set 0x01 counter accept"
 }
 
 test_save_and_validation_side_effects() {
@@ -685,10 +765,11 @@ test_set_sequence_ipv4() {
     assert_in_order "$LAST_LOG" \
         "nft delete table inet transparent_proxy" \
         "nft -f -" \
-        "sysctl -w net.ipv4.ip_forward=1" \
         "ip rule show fwmark 0x01 table 100" \
         "ip rule add fwmark 0x01 table 100" \
         "ip route replace local 0.0.0.0/0 dev lo table 100"
+    assert_not_contains "$LAST_LOG" "sysctl -w net.ipv4.ip_forward=1"
+    assert_not_contains "$LAST_LOG" "net.ipv4.conf"
 }
 
 test_set_sequence_ipv6() {
@@ -699,10 +780,11 @@ test_set_sequence_ipv6() {
     assert_in_order "$LAST_LOG" \
         "nft delete table inet transparent_proxy" \
         "nft -f -" \
-        "sysctl -w net.ipv6.conf.all.forwarding=1" \
         "ip -6 rule show fwmark 0x01 table 106" \
         "ip -6 rule add fwmark 0x01 table 106" \
         "ip -6 route replace local ::/0 dev lo table 106"
+    assert_not_contains "$LAST_LOG" "sysctl -w net.ipv6.conf.all.forwarding=1"
+    assert_not_contains "$LAST_LOG" "net.ipv6.conf"
 }
 
 test_set_sequence_dual_stack() {
@@ -710,8 +792,6 @@ test_set_sequence_dual_stack() {
 
     run_ctrl set-all set --stack=all
     assert_status 0 "$LAST_STATUS" "set all"
-    assert_contains "$LAST_LOG" "sysctl -w net.ipv4.ip_forward=1"
-    assert_contains "$LAST_LOG" "sysctl -w net.ipv6.conf.all.forwarding=1"
     assert_in_order "$LAST_LOG" \
         "ip rule show fwmark 0x01 table 100" \
         "ip rule add fwmark 0x01 table 100" \
@@ -719,6 +799,35 @@ test_set_sequence_dual_stack() {
         "ip -6 rule show fwmark 0x01 table 106" \
         "ip -6 rule add fwmark 0x01 table 106" \
         "ip -6 route replace local ::/0 dev lo table 106"
+    assert_not_contains "$LAST_LOG" "sysctl -w net.ipv4.ip_forward=1"
+    assert_not_contains "$LAST_LOG" "sysctl -w net.ipv6.conf.all.forwarding=1"
+}
+
+test_kernel_bypass_and_rp_filter_policy() {
+    reset_fake_env
+
+    run_ctrl kernel-bypass set --stack=all --enable-kernel-bypass --rp-filter=loose --in-iface=eth0,wg0
+    assert_status 0 "$LAST_STATUS" "kernel bypass apply"
+    assert_contains "$LAST_LOG" "sysctl -w net.ipv4.ip_forward=1"
+    assert_contains "$LAST_LOG" "sysctl -w net.ipv6.conf.all.forwarding=1"
+    assert_contains "$LAST_LOG" "sysctl -w net.ipv4.conf.all.rp_filter=2"
+    assert_contains "$LAST_LOG" "sysctl -w net.ipv4.conf.default.rp_filter=2"
+    assert_contains "$LAST_LOG" "sysctl -w net.ipv4.conf.eth0.rp_filter=2"
+    assert_contains "$LAST_LOG" "sysctl -w net.ipv4.conf.wg0.rp_filter=2"
+    assert_not_contains "$LAST_LOG" "net.ipv6.conf.all.rp_filter"
+
+    reset_fake_env
+    FAKE_SYSCTL_READ_VALUE=1
+    export FAKE_SYSCTL_READ_VALUE
+    run_ctrl kernel-bypass-check set --stack=v4 --rp-filter=check
+    assert_status 1 "$LAST_STATUS" "rp_filter check fail"
+    assert_contains "$LAST_STDOUT" "rp_filter strict value detected"
+    assert_contains "$LAST_LOG" "sysctl -n net.ipv4.conf.all.rp_filter"
+    assert_contains "$LAST_LOG" "nft delete table inet transparent_proxy"
+    assert_contains "$LAST_LOG" "nft -f -"
+    assert_count "$LAST_LOG" "nft delete table inet transparent_proxy" 2
+    assert_not_contains "$LAST_LOG" "ip rule add fwmark"
+    assert_not_contains "$LAST_LOG" "sysctl -w net.ipv4.ip_forward=1"
 }
 
 test_idempotent_route_setup() {
@@ -778,10 +887,10 @@ test_rollback_on_route_failure() {
     assert_in_order "$LAST_LOG" \
         "nft delete table inet transparent_proxy" \
         "nft -f -" \
-        "sysctl -w net.ipv4.ip_forward=1" \
         "ip rule show fwmark 0x01 table 100" \
         "ip rule add fwmark 0x01 table 100" \
         "ip route replace local 0.0.0.0/0 dev lo table 100"
+    assert_not_contains "$LAST_LOG" "sysctl -w net.ipv4.ip_forward=1"
     assert_count "$LAST_LOG" "nft delete table inet transparent_proxy" 2
 }
 
@@ -799,9 +908,12 @@ test_nft_apply_failure() {
 test_optional_nft_parser_check() {
     reset_fake_env
 
-    run_ctrl nft-parser-gen set --save="$WORKDIR/parser.nft" --dry-run
+    run_ctrl nft-parser-gen set --stack=all --in-iface=eth0 --local-addr4=127.0.0.1 --dns-bypass-ports=53 --fake-ip4=198.18.0.0/15 --bypass4=10.0.0.0/8 --hijack-dns --proxy-local --ignore-uid=1000 --save="$WORKDIR/parser.nft" --dry-run
     assert_status 0 "$LAST_STATUS" "parser fixture generation"
     assert_file_exists "$WORKDIR/parser.nft"
+    assert_contains "$WORKDIR/parser.nft" "priority -150"
+    assert_contains "$WORKDIR/parser.nft" "ingress scope"
+    assert_contains "$WORKDIR/parser.nft" "route fakeip"
 
     if [ "${TPROXY_TEST_NFT_CHECK:-0}" != 1 ]; then
         printf 'SKIP optional nft parser check (set TPROXY_TEST_NFT_CHECK=1 to enable)\n'
@@ -872,13 +984,44 @@ test_gateway_check_and_diagnostics() {
 
     run_gateway gateway-check print-command
     assert_status 0 "$LAST_STATUS" "gateway print-command"
-    assert_contains "$LAST_STDOUT" "$case_dir/tproxy_ctrl.sh set --stack=all --nf-table=sg_test --route-table4=200 --route-table6=206 --route-mark=0x20 --tproxy-port=9898 --fake-ip4=198.18.0.0/15 --fake-ip6=fc00::/18"
+    assert_contains "$LAST_STDOUT" "$case_dir/tproxy_ctrl.sh set --stack=all --nf-table=sg_test --route-table4=200 --route-table6=206 --route-mark=0x20 --tproxy-port=9898 --dns-bypass-ports=53 --fake-ip4=198.18.0.0/15 --fake-ip6=fc00::/18"
 
     run_gateway gateway-check print-nft
     assert_status 0 "$LAST_STATUS" "gateway print-nft"
     assert_contains "$LAST_STDOUT" "table inet sg_test"
     assert_contains "$LAST_STDOUT" "198.18.0.0/15"
     assert_not_contains "$LAST_LOG" "nft -f -"
+}
+
+test_gateway_new_option_passthrough() {
+    reset_fake_env
+    case_dir="$WORKDIR/gateway-new-options"
+    write_gateway_fixture "$case_dir" "$gateway_config_single"
+    cat >> "$case_dir/gateway.conf" <<'EOF'
+IN_IFACE=eth0,wg0
+BYPASS4=10.0.0.0/8,192.168.0.0/16
+LOCAL_ADDR4=127.0.0.1,10.0.0.10
+LOCAL_TCP_PORTS=80,8080
+DNS_BYPASS_PORTS=53,5353
+RP_FILTER=loose
+ENABLE_KERNEL_BYPASS=1
+EOF
+
+    run_gateway gateway-new-options check
+    assert_status 0 "$LAST_STATUS" "gateway check new options"
+    assert_contains "$LAST_STDOUT" "in_iface=eth0,wg0"
+    assert_contains "$LAST_STDOUT" "bypass4=10.0.0.0/8,192.168.0.0/16"
+    assert_contains "$LAST_STDOUT" "local_tcp_ports=80,8080"
+    assert_contains "$LAST_STDOUT" "rp_filter=loose"
+    assert_contains "$LAST_STDOUT" "enable_kernel_bypass=1"
+
+    run_gateway gateway-new-options print-command
+    assert_status 0 "$LAST_STATUS" "gateway print-command new options"
+    assert_contains "$LAST_STDOUT" "--in-iface=eth0,wg0"
+    assert_contains "$LAST_STDOUT" "--bypass4=10.0.0.0/8,192.168.0.0/16"
+    assert_contains "$LAST_STDOUT" "--local-tcp-ports=80,8080"
+    assert_contains "$LAST_STDOUT" "--rp-filter=loose"
+    assert_contains "$LAST_STDOUT" "--enable-kernel-bypass"
 }
 
 test_gateway_enable_disable() {
@@ -1235,14 +1378,17 @@ main() {
     run_test "Route table boundaries" test_route_table_boundaries
     run_test "UID boundaries" test_uid_boundaries
     run_test "FakeIP CIDR validation" test_fakeip_cidr_validation
+    run_test "Hardened option validation" test_hardened_option_validation
     run_test "Dry-run stack selection" test_dry_run_stack_selection
     run_test "DNS hijack and reroute" test_dns_hijack_and_local_reroute
     run_test "FakeIP stack combinations" test_fakeip_stack_combinations
     run_test "Proxy-local bypass ordering" test_proxy_local_bypass_ordering
+    run_test "Hardened prerouting and output order" test_hardened_prerouting_and_output_order
     run_test "Save and validation side effects" test_save_and_validation_side_effects
     run_test "IPv4 set sequence" test_set_sequence_ipv4
     run_test "IPv6 set sequence" test_set_sequence_ipv6
     run_test "Dual-stack set sequence" test_set_sequence_dual_stack
+    run_test "Kernel bypass and rp_filter policy" test_kernel_bypass_and_rp_filter_policy
     run_test "Idempotent route setup" test_idempotent_route_setup
     run_test "Unset cleanup attempts" test_unset_cleanup_attempts
     run_test "Unset tolerates missing state" test_unset_tolerates_missing_state
@@ -1252,6 +1398,7 @@ main() {
     run_test "Optional nft parser check" test_optional_nft_parser_check
     run_test "sing-gateway package layout" test_gateway_package_layout
     run_test "sing-gateway check and diagnostics" test_gateway_check_and_diagnostics
+    run_test "sing-gateway new option passthrough" test_gateway_new_option_passthrough
     run_test "sing-gateway enable and disable" test_gateway_enable_disable
     run_test "sing-gateway enable refuses unmanaged drop-in" test_gateway_enable_refuses_unmanaged_dropin
     run_test "sing-gateway discovery and safety" test_gateway_discovery_and_safety

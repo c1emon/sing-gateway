@@ -17,6 +17,23 @@
 
 整体框架合理，但作为生产透明网关规则仍不完备。
 
+## 本轮硬化决策
+
+本轮继续保留 `tproxy_ctrl.sh` 为 POSIX shell 实现，不引入 Python/Go/Rust 运行时依赖。原因是当前仓库、Debian companion package 和回归测试都围绕无额外依赖的 shell 脚本组织；本次目标是规则硬化而不是重写控制器。
+
+但该脚本已经接近“小型策略编译器”。后续如果需要完整 CIDR 重叠分析、多命名策略配置、拓扑自动推断、结构化诊断输出或 OPNsense 配置联动，应迁移到 Python 或其他结构化控制器，并使用标准库/成熟库处理网段、接口和策略模型。
+
+### P0/P1 安全发现
+
+- **hook priority 必须显式**：TPROXY prerouting 必须在路由查找前执行，且 dry-run 输出中应能看到确定的 numeric priority。`divert` 与主 prerouting 链不应依赖同优先级或隐式顺序。
+- **divert 顺序必须独立且可审计**：transparent socket divert 需要先于主 TPROXY pipeline，并与入口范围保持一致，避免非目标接口上的连接被脚本误处理。
+- **入口范围必须先判定**：生产部署应配置 `--in-iface=<iface[,iface...]>` allow-list。Docker、WireGuard、loopback、管理网卡或其他虚拟接口不应被默认纳入透明代理。
+- **rp_filter 是单臂 PBR 前置风险**：来自 LAN/VLAN 的源地址经 OPNsense PBR 到达 DMZ/服务接口时，严格反向路径过滤可能在 nftables 前丢包。应使用 `--rp-filter=check` 检查，或显式 `--rp-filter=loose|disable` 应用安全值。
+- **DNS hijack 必须排除本地/基础设施 DNS**：`--hijack-dns` 只适合劫持剩余的外部 DNS 流量；上游 DNAT 到 W 本机 DNS listener 的流量、AD/内部 DNS、管理 DNS 应通过 `--dns-bypass4/6`、`--local-addr4/6` 和端口绕过先接受。
+- **FakeIP 必须优先于 private/custom bypass**：`198.18.0.0/15` 常同时属于 FakeIP 和保留地址。启用 FakeIP 时必须传 `--fake-ip4/6`，并在规则顺序上位于 private/custom bypass 之前；与 `--bypass4/6` 完全相同的 CIDR 应拒绝。
+- **output 链需要对称绕过**：`--proxy-local` 必须先处理 ignore UID/mark、loopback、本机服务、DNS 绕过、FakeIP/custom bypass，再做通用 reroute，避免代理进程或本机监听服务形成回环。
+- **kernel bypass 不等于 sing-box direct**：nft `accept` 只表示不进入 TPROXY，后续能否转发取决于 Linux forwarding、OPNsense NAT/防火墙/anti-spoofing/PBR 防环路。脚本不应把 forwarding 作为基础 TPROXY 的无条件前提；只有显式 `--enable-kernel-bypass` 才应用 forwarding sysctl。
+
 ## 主要风险与不完备点
 
 ### 1. 缺少入接口限定
