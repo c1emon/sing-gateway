@@ -1,8 +1,8 @@
-# OPNsense 代理网关具体实践方法
+# OPNsense 代理网关实践
 
-本文是 `proxy_arch.md` 的 OPNsense 落地实践说明。
+本文是 [`proxy-architecture.md`](proxy-architecture.md) 的 OPNsense 落地实践说明。
 
-架构、角色定义、Proxy Gateway VIP 语义、FakeDNS/FakeIP 约束、PBR 边界、TPROXY 排除规则、direct/bypass 语义等均以 `proxy_arch.md` 为准。本文只说明在 OPNsense + 单网卡代理网关场景下，如何把该架构落地。
+架构、角色定义、Proxy Gateway VIP 语义、FakeDNS/FakeIP 约束、PBR 边界、TPROXY 排除规则、direct/bypass 语义等均以 [`proxy-architecture.md`](proxy-architecture.md) 为准。本文只说明在 OPNsense + 单网卡代理网关场景下，如何把该架构落地。
 
 ## 1. 适用范围
 
@@ -28,8 +28,8 @@
                 │ 主网关/防火墙 │
                 └──┬───┬───┬──┘
              LAN_A LAN_B LAN_C  DMZ: 10.255.255.0/24
-               │     │     │        │
-        VIP: .100 .100 .100   ┌─────┴─────┐
+               │     │     │         │
+        VIP: .100 .100 .100    ┌─────┴─────┐
                                │ 代理网关   │
                                │10.255.255.10│
                                │ sing-box  │
@@ -453,11 +453,11 @@ DNS / FakeIP 配置应确保：
 6. **混淆 direct 与 bypass**  
    `sing-box direct` 是代理程序接管后的直连出站；kernel bypass 是内核三层转发原始包。两者对应的 OPNsense NAT、anti-spoofing、环路风险不同。
 
-## 9. 与 `proxy_arch.md` 的关系
+## 9. 与 `proxy-architecture.md` 的关系
 
 本文只描述 OPNsense 上的具体配置方法和验证步骤。
 
-如本文与 `proxy_arch.md` 在架构原则上存在差异，以 `proxy_arch.md` 为准。实施前必须先确认：
+如本文与 [`proxy-architecture.md`](proxy-architecture.md) 在架构原则上存在差异，以 [`proxy-architecture.md`](proxy-architecture.md) 为准。实施前必须先确认：
 
 1. Proxy Gateway VIP 由 OPNsense 持有。
 2. VIP 服务访问走精确 DNAT / port-forward。

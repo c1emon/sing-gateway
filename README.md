@@ -1,6 +1,8 @@
-# tproxy
+# sing-gateway
 
-用于 TProxy 网关场景的透明代理控制脚本，负责配置 Linux nftables 和策略路由。
+用于 `sing-box` TProxy 网关场景的透明代理控制脚本与 Debian companion package，负责发现 sing-box TProxy 入站、生成 nftables 规则、配置 Linux 策略路由，并提供可审计的 systemd 集成入口。
+
+本项目面向“单臂代理网关 / OPNsense PBR / FakeDNS + FakeIP / 透明代理”部署场景。架构设计和 OPNsense 落地说明见 [文档](#文档)。
 
 ## 功能说明
 
@@ -21,8 +23,112 @@
 - `scripts/tproxy_ctrl.sh`：主控制脚本源码，用于设置和清理 TProxy 相关规则。
 - `scripts/sing-gateway`：Debian companion package 的用户入口源码，用于发现 sing-box 配置、验证并委托 `tproxy_ctrl.sh`。
 - `packaging/`、`debian/`：`sing-gateway` 包的默认配置、systemd drop-in 模板和 Debian 打包元数据。
+- `docs/`：架构设计、OPNsense 实践和 Debian companion package 说明。
 - `tests/run.sh`：无外部依赖的 POSIX shell 回归测试套件。
 - `Makefile`：可选维护者辅助入口，`make deb` 仅委托标准 Debian 构建工具。
+
+## 文档
+
+- [代理网关接入架构](docs/proxy-architecture.md)：角色定义、三种接入方式、VIP 语义、FakeDNS/FakeIP、PBR、TPROXY、direct/bypass、IPv6、MTU/PMTUD、HA 与安全边界。
+- [OPNsense 代理网关实践](docs/opnsense-proxy-gateway.md)：OPNsense + 单网卡 Linux 代理网关的 VIP、DNAT、PBR、Alias、NAT、验证清单和常见错误。
+- [sing-gateway Debian companion package](docs/sing-gateway.md)：包文件布局、默认配置、systemd drop-in、启用/禁用和打包生命周期。
+
+`tproxy_enhence.md` 中记录的 TPROXY 硬化项已经落实到 `scripts/tproxy_ctrl.sh`、测试和 README/架构文档中，不再作为独立待办文档保留。
+
+## 快速开始
+
+### 1. 安装 sing-box
+
+Debian/Ubuntu 可按 sing-box 官方 APT 源安装：
+
+```sh
+sudo mkdir -p /etc/apt/keyrings
+sudo curl -fsSL https://sing-box.app/gpg.key -o /etc/apt/keyrings/sagernet.asc
+sudo chmod a+r /etc/apt/keyrings/sagernet.asc
+
+cat <<'EOF' | sudo tee /etc/apt/sources.list.d/sagernet.sources
+Types: deb
+URIs: https://deb.sagernet.org/
+Suites: *
+Components: *
+Enabled: yes
+Signed-By: /etc/apt/keyrings/sagernet.asc
+EOF
+
+sudo apt-get update
+sudo apt-get install sing-box
+```
+
+### 2. 配置 sing-box TProxy 入站
+
+sing-box 配置中需要至少一个 `tproxy` inbound，例如：
+
+```json
+{
+  "type": "tproxy",
+  "tag": "tproxy-in",
+  "listen": "::",
+  "listen_port": 9898,
+  "sniff": true,
+  "sniff_override_destination": false
+}
+```
+
+### 3. 配置 sing-gateway
+
+安装 Debian 包后，编辑：
+
+```sh
+sudoedit /etc/sing-gateway/gateway.conf
+```
+
+最小示例：
+
+```sh
+STACK=all
+IN_IFACE=eth0
+NF_TABLE=transparent_proxy
+ROUTE_TABLE4=100
+ROUTE_TABLE6=106
+ROUTE_MARK=0x01
+RP_FILTER=check
+```
+
+FakeIP / DNS 劫持示例：
+
+```sh
+STACK=all
+IN_IFACE=eth0
+FAKEIP_V4=198.18.0.0/15
+FAKEIP_V6=fc00::/18
+HIJACK_DNS=1
+DNS_BYPASS4=10.0.0.1
+LOCAL_ADDR4=10.255.255.10
+LOCAL_TCP_PORTS=22,7890,9898
+LOCAL_UDP_PORTS=53
+RP_FILTER=check
+```
+
+Docker、WireGuard、管理接口或其他虚拟接口不应放入 `IN_IFACE`。如果只希望代理从 OPNsense/主网关 PBR 导入的流量，通常只填写代理网关连接主网关的生产接口。
+
+### 4. 检查并启用 systemd 集成
+
+```sh
+sudo sing-gateway check
+sudo sing-gateway print-command
+sudo sing-gateway print-nft
+sudo sing-gateway enable
+sudo systemctl restart sing-box.service
+```
+
+禁用：
+
+```sh
+sudo sing-gateway disable
+sudo systemctl restart sing-box.service
+```
+
+也可以不安装包，直接使用 `scripts/tproxy_ctrl.sh` 进行 dry-run 或手动应用，见下文。
 
 ## 使用方法
 
