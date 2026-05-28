@@ -78,6 +78,33 @@ and description. The file layout should include `/usr/bin/sing-gateway`,
 `/usr/share/doc/sing-gateway/`.
 Moving source scripts under `scripts/` must not change these installed paths.
 
+## Publishing Debian package release assets
+
+Maintainers publish package artifacts by pushing a version tag that matches
+`v*`, for example `v0.1.0`. The tag-triggered GitHub Actions workflow does not
+run release publication for branch pushes or pull requests.
+
+Before publishing, the workflow strips the leading `v` from the tag name and
+requires it to exactly match `dpkg-parsechangelog --show-field Version`. A tag
+such as `v0.1.0` therefore requires `debian/changelog` to declare version
+`0.1.0`; mismatches fail before release assets are created or updated.
+
+The workflow builds from the repository root with the same canonical command:
+
+```sh
+dpkg-buildpackage -us -uc -b
+```
+
+It then inspects the generated `.deb` with `dpkg-deb --info` and
+`dpkg-deb --contents`, and runs strict `lintian` validation on the generated
+`.changes` and `.deb` files. Only after validation succeeds does the workflow
+create or update the GitHub Release for the tag and upload the generated
+`.deb`, `.changes`, and `.buildinfo` files as release assets.
+
+The release workflow publishes GitHub Release assets only. It does not generate
+or publish an apt repository, `Packages` indexes, `Release` files, `InRelease`
+metadata, or repository signing metadata.
+
 ## Package lifecycle validation
 
 Run install/remove/purge validation only in a disposable Debian or Ubuntu test

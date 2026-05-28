@@ -278,6 +278,10 @@ lintian ../sing-gateway_<version>_<arch>.changes ../sing-gateway_*_all.deb
 
 `debian/source/format` 应为 `3.0 (native)`，`debian/changelog` 版本不应包含 Debian revision 后缀（例如 `-1`），项目 `LICENSE` 与 `debian/copyright` 应声明 GPL-3+，并在 Debian 版权元数据中指向 `/usr/share/common-licenses/GPL-3`。`dpkg-deb --info` 应展示包名、版本、架构、依赖、维护者和描述；文件列表应包含 CLI、控制脚本、默认配置、文档和 systemd drop-in 模板。
 
+发布 Debian 包时，维护者推送匹配 `v*` 的标签会触发 GitHub Release 工作流；普通分支 push 和 pull request 不会发布 release 或上传资产。工作流会先比较标签去掉前导 `v` 后的版本与 `dpkg-parsechangelog --show-field Version` 输出，二者必须完全一致才会继续构建、检查和发布。例如 `v0.1.0` 只会发布 `debian/changelog` 版本为 `0.1.0` 的包。
+
+标签工作流仍使用仓库根目录下的标准命令 `dpkg-buildpackage -us -uc -b`，然后运行 `dpkg-deb --info`、`dpkg-deb --contents` 和严格 `lintian` 校验。校验成功后，工作流会为该标签创建或更新 GitHub Release，并上传生成的 `.deb`、`.changes` 和 `.buildinfo` 文件作为 release assets。该工作流只发布 GitHub Release 资产，不生成或发布 apt repository、`Packages` 索引、`Release` 文件或 `InRelease` 元数据。
+
 建议只在一次性 Debian/Ubuntu VM 或容器中测试安装生命周期：
 
 ```sh
