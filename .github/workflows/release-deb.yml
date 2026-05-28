@@ -61,7 +61,7 @@ jobs:
         run: dpkg-deb --contents "$DEB_FILE"
 
       - name: Run strict lintian validation
-        run: lintian --fail-on warning "$CHANGES_FILE" "$DEB_FILE"
+        run: lintian --profile debian --fail-on warning "$CHANGES_FILE" "$DEB_FILE"
 
       - name: Publish GitHub Release assets
         uses: softprops/action-gh-release@v2

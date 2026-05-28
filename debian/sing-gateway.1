@@ -1,0 +1,71 @@
+.TH SING\-GATEWAY 1 "May 2026" "sing\-gateway 0.1.0" "User Commands"
+.SH NAME
+sing\-gateway \- manage sing\-box TProxy gateway integration
+.SH SYNOPSIS
+.B sing\-gateway
+.I command
+.RI [ options ]
+.SH DESCRIPTION
+.B sing\-gateway
+is a companion command for sing\-box gateway deployments. It discovers the local
+sing\-box configuration, validates gateway settings, and applies or removes the
+optional TProxy gateway integration.
+.
+.PP
+Installation is inert by default. Gateway state is changed only when an explicit
+command such as
+.B enable
+or
+.B set
+is run.
+.SH COMMANDS
+.TP
+.B check
+Validate and print the resolved gateway configuration.
+.TP
+.B print\-command
+Print the delegated
+.B tproxy_ctrl.sh set
+command without applying it.
+.TP
+.B print\-nft
+Print generated nftables rules through
+.B tproxy_ctrl.sh \-\-dry\-run.
+.TP
+.B set
+Apply the resolved gateway state through
+.BR tproxy_ctrl.sh .
+.TP
+.B unset
+Clean managed gateway state through
+.BR tproxy_ctrl.sh .
+.TP
+.B enable [\-\-force]
+Install the sing\-box.service drop\-in and reload systemd.
+.TP
+.B disable
+Remove the sing\-box.service drop\-in, perform best\-effort cleanup, and reload
+systemd.
+.SH ENVIRONMENT
+.TP
+.B SING_GATEWAY_CONFIG
+Path to the gateway configuration file. Defaults to
+.IR /etc/sing\-gateway/gateway.conf .
+.TP
+.B SING_GATEWAY_CTRL
+Path to the delegated TProxy control script.
+.TP
+.B SING_GATEWAY_SERVICE
+Name of the managed sing\-box systemd service. Defaults to
+.IR sing\-box.service .
+.SH FILES
+.TP
+.I /etc/sing\-gateway/gateway.conf
+Gateway configuration file.
+.TP
+.I /usr/lib/sing\-gateway/tproxy_ctrl.sh
+Delegated TProxy control script.
+.SH SEE ALSO
+.BR sing\-box (8),
+.BR systemctl (1),
+.BR nft (8)
