@@ -1,7 +1,10 @@
 Source: sing-gateway
 Section: net
 Priority: optional
-Maintainer: sing-gateway maintainers <maintainers@example.invalid>
+Maintainer: clemon <chen@clemon.icu>
+Homepage: https://github.com/c1emon/sing-gateway
+Vcs-Browser: https://github.com/c1emon/sing-gateway
+Vcs-Git: https://github.com/c1emon/sing-gateway.git
 Standards-Version: 4.6.2
 Rules-Requires-Root: no
 Build-Depends: debhelper-compat (= 13)

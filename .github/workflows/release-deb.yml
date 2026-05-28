@@ -1,0 +1,76 @@
+name: Publish Debian package release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    name: Build, validate, and publish Debian package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Debian build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            debhelper \
+            devscripts \
+            dpkg-dev \
+            fakeroot \
+            lintian
+
+      - name: Verify tag matches debian/changelog version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          changelog_version="$(dpkg-parsechangelog --show-field Version)"
+          if [ "$tag_version" != "$changelog_version" ]; then
+            printf 'Tag version (%s) does not match debian/changelog version (%s)\n' "$tag_version" "$changelog_version" >&2
+            exit 1
+          fi
+
+      - name: Build Debian binary package
+        run: dpkg-buildpackage -us -uc -b
+
+      - name: Locate Debian package artifacts
+        run: |
+          deb_file="$(find .. -maxdepth 1 -type f -name 'sing-gateway_*.deb' -print -quit)"
+          changes_file="$(find .. -maxdepth 1 -type f -name 'sing-gateway_*.changes' -print -quit)"
+          buildinfo_file="$(find .. -maxdepth 1 -type f -name 'sing-gateway_*.buildinfo' -print -quit)"
+
+          test -n "$deb_file"
+          test -n "$changes_file"
+          test -n "$buildinfo_file"
+
+          printf 'DEB_FILE=%s\n' "$deb_file" >> "$GITHUB_ENV"
+          printf 'CHANGES_FILE=%s\n' "$changes_file" >> "$GITHUB_ENV"
+          printf 'BUILDINFO_FILE=%s\n' "$buildinfo_file" >> "$GITHUB_ENV"
+
+      - name: Inspect Debian package metadata
+        run: dpkg-deb --info "$DEB_FILE"
+
+      - name: Inspect Debian package contents
+        run: dpkg-deb --contents "$DEB_FILE"
+
+      - name: Run strict lintian validation
+        run: lintian --fail-on warning "$CHANGES_FILE" "$DEB_FILE"
+
+      - name: Publish GitHub Release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.DEB_FILE }}
+            ${{ env.CHANGES_FILE }}
+            ${{ env.BUILDINFO_FILE }}
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          make_latest: true
+          overwrite_files: true
